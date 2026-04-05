@@ -69,17 +69,22 @@ def extract_all_selectors(rules):
     """
     return [get_selector(r) for r in get_qualified_rules(rules)]
 
-def update_declaration(rule, property_name: str, new_value: str):
+def update_declaration(rule, property_name: str, new_value: str) -> None:
     """
-    Update a specific property in a rule.
+    Update a specific property's value inside a rule.
     """
-    decls = tinycss2.parse_blocks_contents(rule.content)
-
-    for d in decls:
-        if d.type == "declaration" and d.name == property_name:
-            d.value = tinycss2.parse_component_value_list(new_value)
-
-    rule.content = tinycss2.serialize(decls)
+    tokens = tinycss2.parse_blocks_contents(rule.content)
+    parts = []
+ 
+    for token in tokens:
+        if token.type == "declaration" and token.name == property_name:
+            
+            important = " !important" if token.important else ""
+            parts.append(f"{property_name}: {new_value}{important}")
+        else:
+            parts.append(tinycss2.serialize([token]))
+ 
+    rule.content = "; ".join(p for p in parts if p.strip())
 
 def remove_rule_by_selector(rules, target_selector: str):
     """
@@ -96,18 +101,23 @@ def remove_rule_by_selector(rules, target_selector: str):
 
     return new_rules
 
-def extract_media_queries(rules):
+def extract_media_queries(rules) -> list:
     """
-    Returns list of (condition, inner_rules)
+    Returns list of (condition_string, inner_rules) for all @media blocks.
     """
     media_rules = []
-
+ 
     for rule in get_media_rules(rules):
         condition = tinycss2.serialize(rule.prelude).strip()
-        inner_rules = tinycss2.parse_rule_list(rule.content)
-
+ 
+        inner_rules = tinycss2.parse_stylesheet(
+            tinycss2.serialize(rule.content),
+            skip_whitespace=True,
+            skip_comments=True,
+        )
+ 
         media_rules.append((condition, inner_rules))
-
+ 
     return media_rules
 
 def has_layout_properties(rule, layout_props):

@@ -21,6 +21,7 @@ def apply_action(css: str, action: CssAction) -> Tuple[str, bool]:
     """
     if action.value is None and action.action_type != "remove_rule":
         return css, False # no operation
+    
     rules = parse_css(css)
     og_css = css
 
@@ -50,15 +51,15 @@ def apply_action(css: str, action: CssAction) -> Tuple[str, bool]:
 
 def _replace_color(rules, target: str, value: str):
     """
-    Replace all occurrences of the target color.
+    Replace all occurrences of the target color value across the stylesheet.
     """
-    for rule in rules:
+    for rule in get_qualified_rules(rules):
         decl_map = get_declaration_map(rule)
         for prop, val in decl_map.items():
             if target in val:
                 new_val = val.replace(target, value)
                 update_declaration(rule, prop, new_val)
-
+ 
     return rules
 
 def _remove_rule(rules, selector: str):
@@ -69,18 +70,17 @@ def _remove_rule(rules, selector: str):
 
 def _fix_spacing(rules, target: str, value: str):
     """
-    Fix spacing property (e.g. margin, padding).
-    target format: ".card.margin"
+    Fix a specific spacing property on a specific selector.
     """
     try:
-        selector, prop = target.rsplit(".", 1)
+        selector, prop = target.rsplit("::", 1)
     except ValueError:
         return rules
-    
+ 
     for rule in get_qualified_rules(rules):
         if get_selector(rule) == selector:
             update_declaration(rule, prop, value)
-
+ 
     return rules
 
 def _fix_typography(rules, target: str, value: str):
