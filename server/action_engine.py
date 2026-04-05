@@ -1,16 +1,27 @@
 from typing import Tuple
 
-from ..models import CssAction
-
-from css_parser import (
-    parse_css,
-    serialize_css,
-    get_qualified_rules,
-    get_selector,
-    get_declaration_map,
-    remove_rule_by_selector,
-    update_declaration,
-)
+try:
+    from ..models import CssAction
+    from .css_parser import (
+        parse_css,
+        serialize_css,
+        get_qualified_rules,
+        get_selector,
+        get_declaration_map,
+        remove_rule_by_selector,
+        update_declaration,
+    )
+except ImportError:
+    from models import CssAction
+    from css_parser import (
+        parse_css,
+        serialize_css,
+        get_qualified_rules,
+        get_selector,
+        get_declaration_map,
+        remove_rule_by_selector,
+        update_declaration,
+    )
 
 def apply_action(css: str, action: CssAction) -> Tuple[str, bool]:
     """

@@ -4,15 +4,24 @@ from typing import Optional
 
 import tinycss2
 
-from .css_parser import (
-    get_declaration_map,
-    get_qualified_rules,
-    get_selector,
-    parse_css,
-    serialize_css,
-    update_declaration,
-)
-
+try:
+    from .css_parser import (
+        get_declaration_map,
+        get_qualified_rules,
+        get_selector,
+        parse_css,
+        serialize_css,
+        update_declaration,
+    )
+except ImportError:
+    from css_parser import (
+        get_declaration_map,
+        get_qualified_rules,
+        get_selector,
+        parse_css,
+        serialize_css,
+        update_declaration,
+    )
 
 _COLOR_PROPS = {
     "color", "background-color", "background", "border-color",
