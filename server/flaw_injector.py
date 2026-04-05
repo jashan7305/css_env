@@ -4,7 +4,7 @@ from typing import Optional
 
 import tinycss2
 
-from css_parser import (
+from .css_parser import (
     get_declaration_map,
     get_qualified_rules,
     get_selector,
