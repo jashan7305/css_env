@@ -14,9 +14,11 @@ version = "0.1.0"
 description = "Css Env environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
+    "cssselect2>=0.9.0",
     # Core OpenEnv runtime (provides FastAPI server + HTTP client types)
     # install from github
     # "openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git",
+    "lxml>=6.0.2",
     "openenv-core[core]>=0.2.1",
     # Environment-specific dependencies
     # Add all dependencies needed for your environment here
@@ -26,6 +28,8 @@ dependencies = [
     # "gymnasium>=0.29.0",
     # "openspiel>=1.0.0",
     # "smolagents>=1.22.0,<2",
+    "pydantic>=2.12.5",
+    "tinycss2>=1.5.1",
 ]
 
 [project.optional-dependencies]
