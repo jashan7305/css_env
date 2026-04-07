@@ -74,3 +74,38 @@ class CssObservation(Observation):
         default=None,
         description="List of violations (only present in easy task)"
     )
+
+    scores: Optional[Dict[str, float]] = Field(
+        default=None,
+        description="Latest grader scores by rubric name"
+    )
+
+    score: Optional[float] = Field(
+        default=None,
+        description="Task score in [0, 1] based on the minimum grader score"
+    )
+
+    success: Optional[bool] = Field(
+        default=None,
+        description="True only when all grader scores exceed the task threshold"
+    )
+
+    changed: Optional[bool] = Field(
+        default=None,
+        description="Whether this action changed CSS content"
+    )
+
+    no_op_action: Optional[bool] = Field(
+        default=None,
+        description="True when old and new CSS are identical"
+    )
+
+    repeated_action: Optional[bool] = Field(
+        default=None,
+        description="True when this action matches the previous action signature"
+    )
+
+    terminated_by_max_steps: Optional[bool] = Field(
+        default=None,
+        description="True when episode ended due to step limit before success"
+    )

@@ -79,6 +79,13 @@ class CssEnv(
             css=obs_data.get("css", ""),
             tokens=obs_data.get("tokens", {}),
             violations=obs_data.get("violations"),
+            scores=obs_data.get("scores"),
+            score=obs_data.get("score"),
+            success=obs_data.get("success"),
+            changed=obs_data.get("changed"),
+            no_op_action=obs_data.get("no_op_action"),
+            repeated_action=obs_data.get("repeated_action"),
+            terminated_by_max_steps=obs_data.get("terminated_by_max_steps"),
         )
 
         return StepResult(
