@@ -22,12 +22,15 @@ MAX_STEPS = int(os.getenv("MAX_STEPS", "20"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "250"))
 SUCCESS_THRESHOLD = 0.95
+CURRENT_TASK_DIFFICULTY = "easy"
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
     You are a frontend engineer fixing CSS to match design tokens.
     Optimize for score improvement across all graders, not a single metric.
     If the previous action had no effect or repeated a past action, choose a different action_type or target.
+    Do NOT repeat the same action if reward decreases.
+    If a change reduces reward, try a different action type.
     Prioritize the lowest-scoring grader first.
     Return ONLY valid JSON with this schema:
     {
@@ -182,7 +185,7 @@ def _candidate_actions(obs) -> List[Dict[str, Any]]:
             {"action_type": "fix_contrast", "target": ".text", "value": "#333333,#ffffff"}
         )
 
-    if scores.get("layout", 1.0) < 0.95:
+    if scores.get("layout", 1.0) < 0.95 and CURRENT_TASK_DIFFICULTY != "easy":
         candidates.append(
             {"action_type": "add_breakpoint", "target": "768px", "value": ".card { width: 100%; }"}
         )
@@ -193,8 +196,11 @@ def _candidate_actions(obs) -> List[Dict[str, Any]]:
         )
 
     if not candidates:
+        if CURRENT_TASK_DIFFICULTY != "easy":
+            candidates.append(
+                {"action_type": "add_breakpoint", "target": "640px", "value": ".card { width: 100%; }"}
+            )
         candidates.extend([
-            {"action_type": "add_breakpoint", "target": "640px", "value": ".card { width: 100%; }"},
             {"action_type": "fix_typography", "target": ".text.line-height", "value": "1.6"},
             {"action_type": "remove_rule", "target": ".unused", "value": None},
             default_fallback_action(),
@@ -203,11 +209,17 @@ def _candidate_actions(obs) -> List[Dict[str, Any]]:
     return [safe_action_dict(c) for c in candidates]
 
 
-def choose_non_repeating_action(obs, seen_signatures: List[str]) -> Dict[str, Any]:
+def choose_non_repeating_action(
+    obs,
+    seen_signatures: List[str],
+    avoid_action_type: str = "",
+) -> Dict[str, Any]:
     blocked = set(seen_signatures)
     scores = getattr(obs, "scores", None) or {}
     for candidate in _candidate_actions(obs):
         sig = action_signature(candidate)
+        if avoid_action_type and candidate.get("action_type") == avoid_action_type:
+            continue
         score_key = _score_key_for_action_type(candidate.get("action_type", ""))
         if score_key and scores.get(score_key, 0.0) >= SUCCESS_THRESHOLD:
             continue
@@ -216,21 +228,39 @@ def choose_non_repeating_action(obs, seen_signatures: List[str]) -> Dict[str, An
 
     # Last-resort deterministic rotation to avoid an exact repeated signature.
     fallback_pool = [
-        {"action_type": "add_breakpoint", "target": "640px", "value": ".card { width: 100%; }"},
         {"action_type": "fix_typography", "target": ".text.line-height", "value": "1.6"},
         {"action_type": "remove_rule", "target": ".unused", "value": None},
     ]
+    if CURRENT_TASK_DIFFICULTY != "easy":
+        fallback_pool.insert(
+            0,
+            {"action_type": "add_breakpoint", "target": "640px", "value": ".card { width: 100%; }"},
+        )
     if scores.get("spacing", 0.0) < SUCCESS_THRESHOLD:
         fallback_pool.append(default_fallback_action())
 
     for candidate in [safe_action_dict(c) for c in fallback_pool]:
+        if avoid_action_type and candidate.get("action_type") == avoid_action_type:
+            continue
         if action_signature(candidate) not in blocked:
             return candidate
 
     return safe_action_dict(fallback_pool[0])
 
 
-def should_override_action(obs, action_payload: Dict[str, Any], seen_signatures: List[str]) -> bool:
+def should_override_action(
+    obs,
+    action_payload: Dict[str, Any],
+    seen_signatures: List[str],
+    reward_decreased: bool = False,
+    last_action_type: str = "",
+) -> bool:
+    if CURRENT_TASK_DIFFICULTY == "easy" and action_payload.get("action_type") == "add_breakpoint":
+        return True
+
+    if reward_decreased and last_action_type and action_payload.get("action_type") == last_action_type:
+        return True
+
     sig = action_signature(action_payload)
     if sig in set(seen_signatures):
         return True
@@ -265,6 +295,7 @@ def get_model_action(client: OpenAI, step: int, obs, history: List[str]) -> Dict
 
 
 async def main() -> None:
+    global CURRENT_TASK_DIFFICULTY
     client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
     if TASK_NAME.lower() == "all":
@@ -279,9 +310,12 @@ async def main() -> None:
         env = await CssEnv.from_docker_image(IMAGE_NAME)
 
     for task_name, task in selected_tasks:
+        CURRENT_TASK_DIFFICULTY = str(task.get("difficulty", "easy")).lower()
         history: List[str] = []
         recent_action_signatures: List[str] = []
         rewards: List[float] = []
+        prev_reward: float = 0.0
+        last_action_type: str = ""
         steps_taken = 0
         success = False
         score = 0.0
@@ -296,8 +330,19 @@ async def main() -> None:
                     break
 
                 action_payload = get_model_action(client, step, result.observation, history)
-                if should_override_action(result.observation, action_payload, recent_action_signatures):
-                    action_payload = choose_non_repeating_action(result.observation, recent_action_signatures)
+                reward_decreased = bool(rewards) and (rewards[-1] < prev_reward)
+                if should_override_action(
+                    result.observation,
+                    action_payload,
+                    recent_action_signatures,
+                    reward_decreased=reward_decreased,
+                    last_action_type=last_action_type,
+                ):
+                    action_payload = choose_non_repeating_action(
+                        result.observation,
+                        recent_action_signatures,
+                        avoid_action_type=last_action_type if reward_decreased else "",
+                    )
                 action = CssAction(**action_payload)
 
                 error_val = "null"
@@ -310,8 +355,13 @@ async def main() -> None:
 
                 reward = float(result.reward or 0.0)
                 rewards.append(reward)
+                if len(rewards) >= 2:
+                    prev_reward = rewards[-2]
+                else:
+                    prev_reward = reward
                 steps_taken = step
                 recent_action_signatures.append(action_signature(action_payload))
+                last_action_type = str(action_payload.get("action_type", ""))
 
                 score = float(getattr(result.observation, "score", score) or score)
                 score = max(0.0, min(1.0, score))

@@ -3,7 +3,10 @@ def compute_reward(
     action_valid=True,
     done=False,
     action_repeated=False,
+    action_duplicate=False,
+    action_irrelevant=False,
     previous_scores=None,
+    previous_reward=None,
 ):
     reward = (
         0.30 * scores.get("color", 0) +
@@ -29,11 +32,28 @@ def compute_reward(
     reward += progress_bonus
 
     if not action_valid:
-        reward -= 0.08
+        reward -= 0.10
     if action_repeated:
         reward -= 0.05
+    if action_duplicate:
+        reward -= 0.07
+    if action_irrelevant:
+        reward -= 0.08
 
     if done and all(v >= 0.95 for v in scores.values()):
-        reward += 0.50
+        reward += 0.35
 
-    return float(max(0.0, min(1.5, reward)))
+    # Keep step-to-step reward progression smooth to reduce spikes.
+    if previous_reward is not None:
+        prev = float(previous_reward)
+        penalized = (not action_valid) or action_repeated or action_duplicate or action_irrelevant
+
+        if penalized:
+            # Penalized steps should not look like progress.
+            reward = min(reward, prev - 0.03)
+        else:
+            delta = reward - prev
+            delta = max(-0.12, min(0.18, delta))
+            reward = prev + delta
+
+    return float(max(0.0, min(1.2, reward)))
