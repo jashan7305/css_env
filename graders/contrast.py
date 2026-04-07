@@ -48,18 +48,32 @@ def contrast_ratio(l1, l2):
 def grade(html, css, tokens, state=None):
     try:
         state = state or {}
-        colors = re.findall(r"#(?:[0-9a-fA-F]{3}){1,2}", css)
-        
-        if len(colors) < 2:
+        rule_blocks = re.findall(r"[^{}]+\{([^{}]+)\}", css)
+        if not rule_blocks:
             return 1.0
-        
-        pairs = list(zip(colors[::2], colors[1::2]))
-        
-        if not pairs:
+
+        evaluations = []
+        default_bg = tokens.get("colors", {}).get("white", "#ffffff")
+
+        for block in rule_blocks:
+            fg_match = re.search(r"color\s*:\s*(#(?:[0-9a-fA-F]{3}){1,2})", block)
+            if not fg_match:
+                continue
+
+            bg_match = re.search(r"background-color\s*:\s*(#(?:[0-9a-fA-F]{3}){1,2})", block)
+            if not bg_match:
+                bg_match = re.search(r"background\s*:\s*(#(?:[0-9a-fA-F]{3}){1,2})", block)
+
+            fg = fg_match.group(1)
+            bg = bg_match.group(1) if bg_match else default_bg
+            evaluations.append((fg, bg))
+
+        if not evaluations:
             return 1.0
-        
-        valid = sum(1 for fg, bg in pairs if contrast_ratio(fg, bg) >= 4.5)
-        
-        return float(valid / len(pairs))
+
+        valid = sum(1 for fg, bg in evaluations if contrast_ratio(fg, bg) >= 4.5)
+
+        score = float(valid / len(evaluations))
+        return max(0.0, min(1.0, score))
     except Exception:
         return 0.0

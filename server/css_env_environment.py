@@ -10,22 +10,27 @@
 Css Env Environment Implementation.
 """
 
-from typing import Dict
+import re
+from typing import Dict, List, Optional
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
-from openenv.core.env_server.types import State
+from openenv.core.env_server.types import State, StepResponse
 
 try:
     from ..models import CssAction, CssObservation
     from ..reward import compute_reward
+    from ..graders import colors, spacing, typography, contrast, layout, cleanliness, design_quality
+    from ..tasks import TASKS
     from .action_engine import apply_action
     from .flaw_injector import inject_flaws
 except ImportError:
     from models import CssAction, CssObservation
     from reward import compute_reward
-    from action_engine import apply_action
-    from flaw_injector import inject_flaws
+    from graders import colors, spacing, typography, contrast, layout, cleanliness, design_quality
+    from tasks import TASKS
+    from server.action_engine import apply_action
+    from server.flaw_injector import inject_flaws
 
 
 class CssEnvironment(Environment):
@@ -60,14 +65,16 @@ class CssEnvironment(Environment):
         """Initialize the css_env environment."""
         self.html = "" # html string in the task
         self.css = "" # css string in the task
-        self.design_tokens = {} # design tokens given in the task as a dict of token_name -> value
+        self.tokens = {} # design tokens given in the task as a dict of token_name -> value
         self.config = {} # config given in the task to inject flaws
         self.manifest = [] # list of dicts describing flaws
+        self.difficulty = "easy"
+        self.success_threshold = 0.95
         self.step_count = 0 # current step count
         self.max_steps = 20 # maximum steps
         self.state_data = {} # tracks progress
 
-    def reset(self, task: Dict, seed: int) -> CssObservation:
+    def reset(self, task: Optional[Dict] = None, seed: int = 0) -> CssObservation:
             """
             task = {
                 "html": str,
@@ -80,28 +87,50 @@ class CssEnvironment(Environment):
 
             self.step_count = 0
 
+            if task is None or not isinstance(task, dict) or not task:
+                task = TASKS["task1"]
+
             self.html = task["html"]
-            self.design_tokens = task["design_tokens"]
-            self.config = task["config"]
+            self.tokens = task.get("design_tokens", task.get("tokens", {}))
+            self.config = task.get("config", task.get("flaw_config", {}))
             self.difficulty = task.get("difficulty", "easy")
+            self.max_steps = int(task.get("max_steps", self.max_steps))
+            self.success_threshold = float(task.get("success_threshold", 0.95))
 
-            clean_css = task["css"]
+            clean_css = task.get("css", task.get("clean_css", ""))
 
-            result = inject_flaws(clean_css, self.design_tokens, self.config, seed)
+            result = inject_flaws(clean_css, self.tokens, self.config, seed)
 
             self.css = result["css"]
             self.manifest = result["manifest"]
+            initial_unused_selectors = self._compute_unused_selectors(self.css, self.html)
+
+            if task.get("initial_unused_selectors"):
+                initial_unused_selectors = sorted(
+                    set(initial_unused_selectors) | set(task["initial_unused_selectors"])
+                )
 
             self.state_data = {
+                "episode_id": str(uuid4()),
                 "step_count": 0,
                 "initial_manifest": self.manifest,
+                "initial_unused_selectors": initial_unused_selectors,
             }
+
+            violations = None
+            if self.difficulty == "easy":
+                violations = task.get("violations")
+                if violations is None:
+                    violations = [
+                        {"type": "hint", "selector": "", "message": hint}
+                        for hint in result.get("hints", [])
+                    ]
 
             return CssObservation(
                 html=self.html,
                 css=self.css,
-                design_tokens=self.design_tokens,
-                violations=result["hints"] if self.difficulty == "easy" else None
+                tokens=self.tokens,
+                violations=violations
             )
 
     def step(self, action: CssAction) -> Dict:
@@ -127,7 +156,7 @@ class CssEnvironment(Environment):
         obs = CssObservation(
             html=self.html,
             css=self.css,
-            design_tokens=self.design_tokens,
+            tokens=self.tokens,
             violations=None  # only shown at reset
         )
 
@@ -137,12 +166,14 @@ class CssEnvironment(Environment):
             "changed": is_changed
         }
 
-        return {
-            "observation": obs,
-            "reward": reward,
-            "done": done,
-            "info": info
-        }
+        self.state_data["step_count"] = self.step_count
+
+        return StepResponse(
+            observation=obs.model_dump(),
+            reward=reward,
+            done=done,
+            info=info
+        )
 
     @property
     def state(self) -> State:
@@ -152,23 +183,70 @@ class CssEnvironment(Environment):
         Returns:
             Current State with episode_id and step_count
         """
-        return self.state_data
+        return State(
+            episode_id=self.state_data.get("episode_id"),
+            step_count=self.state_data.get("step_count", 0)
+        )
     
 
-    # you will have to change these later as per your thing
     def _run_graders(self) -> Dict[str, float]:
-        """
-        Temporary dummy graders (Person 2 will replace this).
-        """
-
         return {
-            "color": 0.5,
-            "spacing": 0.5,
-            "typography": 0.5,
-            "contrast": 0.5,
-            "cleanliness": 0.5,
-            "design_quality": 0.5,
+            "color": self._safe_grade(colors.grade),
+            "spacing": self._safe_grade(spacing.grade),
+            "typography": self._safe_grade(typography.grade),
+            "contrast": self._safe_grade(contrast.grade),
+            "layout": self._safe_grade(layout.grade),
+            "cleanliness": self._safe_grade(cleanliness.grade),
+            "design_quality": self._safe_grade(design_quality.grade),
         }
 
     def _is_done(self, scores: Dict[str, float]) -> bool:
-        return all(v >= 0.95 for v in scores.values())
+        required = [
+            "color",
+            "spacing",
+            "typography",
+            "contrast",
+            "layout",
+            "cleanliness",
+            "design_quality",
+        ]
+        return all(scores.get(key, 0.0) >= 0.95 for key in required)
+
+    def _safe_grade(self, grader_fn) -> float:
+        try:
+            score = float(grader_fn(self.html, self.css, self.tokens, self.state_data))
+            return max(0.0, min(1.0, score))
+        except Exception:
+            return 0.0
+
+    def _compute_unused_selectors(self, css: str, html: str) -> List[str]:
+        selector_groups = re.findall(r"([^{}]+)\{", css)
+        selectors: List[str] = []
+
+        for group in selector_groups:
+            for selector in group.split(","):
+                clean = selector.strip()
+                if clean and clean not in selectors:
+                    selectors.append(clean)
+
+        unused = [s for s in selectors if not self._selector_matches_html(s, html)]
+        return sorted(set(unused))
+
+    def _selector_matches_html(self, selector: str, html: str) -> bool:
+        # Ignore pseudo and combinator suffixes and evaluate only the right-most simple token.
+        base = re.split(r"::?|\s+|>|\+|~", selector.strip())[-1]
+        if not base or base == "*":
+            return True
+
+        if base.startswith("."):
+            class_name = base[1:]
+            return bool(re.search(rf'class\s*=\s*["\'][^"\']*\b{re.escape(class_name)}\b', html))
+
+        if base.startswith("#"):
+            element_id = base[1:]
+            return bool(re.search(rf'id\s*=\s*["\']{re.escape(element_id)}["\']', html))
+
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9-]*$", base):
+            return bool(re.search(rf"<{re.escape(base)}(?:\s|>)", html))
+
+        return False

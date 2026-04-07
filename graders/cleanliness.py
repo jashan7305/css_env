@@ -2,7 +2,14 @@ import re
 
 def extract_selectors(css):
     try:
-        return re.findall(r'([^{]+){', css)
+        selector_groups = re.findall(r"(?:^|\})\s*([^{}]+)\{", css)
+        selectors = []
+        for selector_group in selector_groups:
+            for selector in selector_group.split(","):
+                clean = selector.strip()
+                if clean:
+                    selectors.append(clean)
+        return selectors
     except Exception:
         return []
 
@@ -15,7 +22,8 @@ def grade(html, css, tokens, state=None):
         
         if not initial:
             return 1.0
-        
-        return float(len(removed) / len(initial))
+
+        score = float(len(removed) / len(initial))
+        return max(0.0, min(1.0, score))
     except Exception:
         return 0.0

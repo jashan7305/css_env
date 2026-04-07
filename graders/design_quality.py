@@ -3,6 +3,9 @@ import re
 
  # random design elements taken care of by this grader  
 def grade(html, css, tokens, state=None):
+    if not css.strip():
+        return 1.0
+
     score = 1.0
 
     gradients = len(re.findall(r"gradient", css))
@@ -12,7 +15,7 @@ def grade(html, css, tokens, state=None):
 
     colors = re.findall(r"#(?:[0-9a-fA-F]{6})", css)
     unique_colors = set(colors)
-    max_colors = 5
+    max_colors = 6
     if len(unique_colors) > max_colors:
         score -= 0.05 * (len(unique_colors) - max_colors)
 
@@ -44,5 +47,13 @@ def grade(html, css, tokens, state=None):
     max_circles = 2
     if circles > max_circles:
         score -= 0.05 * (circles - max_circles)
+
+    shadow_count = len(re.findall(r"box-shadow\s*:", css))
+    if shadow_count > 3:
+        score -= 0.05 * (shadow_count - 3)
+
+    pill_radius = len(re.findall(r"border-radius\s*:\s*9999px", css))
+    if pill_radius > 0:
+        score -= 0.08 * pill_radius
 
     return max(0.0, min(1.0, score))

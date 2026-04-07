@@ -65,12 +65,12 @@ class CssObservation(Observation):
 
     css: str = Field(..., description="Current CSS stylesheet")
 
-    design_tokens: Dict = Field(
+    tokens: Dict = Field(
         ...,
         description="Design system tokens (colors, spacing, typography, breakpoints)"
     )
 
-    violations: Optional[List[str]] = Field(
+    violations: Optional[List[Dict[str, str]]] = Field(
         default=None,
         description="List of violations (only present in easy task)"
     )

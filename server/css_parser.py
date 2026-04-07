@@ -74,17 +74,34 @@ def update_declaration(rule, property_name: str, new_value: str) -> None:
     Update a specific property's value inside a rule.
     """
     tokens = tinycss2.parse_blocks_contents(rule.content)
-    parts = []
- 
+    names_in_order = []
+    values = {}
+
     for token in tokens:
-        if token.type == "declaration" and token.name == property_name:
-            
-            important = " !important" if token.important else ""
-            parts.append(f"{property_name}: {new_value}{important}")
-        else:
-            parts.append(tinycss2.serialize([token]))
- 
-    rule.content = "; ".join(p for p in parts if p.strip())
+        if token.type != "declaration":
+            continue
+
+        name = token.name
+        serialized_value = tinycss2.serialize(token.value).strip()
+        important = " !important" if token.important else ""
+        values[name] = f"{serialized_value}{important}".strip()
+        if name not in names_in_order:
+            names_in_order.append(name)
+
+    values[property_name] = new_value
+    if property_name not in names_in_order:
+        names_in_order.append(property_name)
+
+    parts = [f"{name}: {values[name]}" for name in names_in_order if values.get(name)]
+    declaration_text = "; ".join(parts)
+    if declaration_text and not declaration_text.endswith(";"):
+        declaration_text += ";"
+
+    rule.content = tinycss2.parse_declaration_list(
+        declaration_text,
+        skip_whitespace=True,
+        skip_comments=True,
+    )
 
 def remove_rule_by_selector(rules, target_selector: str):
     """

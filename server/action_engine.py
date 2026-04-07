@@ -13,7 +13,7 @@ try:
     )
 except ImportError:
     from models import CssAction
-    from css_parser import (
+    from server.css_parser import (
         parse_css,
         serialize_css,
         get_qualified_rules,
@@ -84,7 +84,7 @@ def _fix_spacing(rules, target: str, value: str):
     Fix a specific spacing property on a specific selector.
     """
     try:
-        selector, prop = target.rsplit("::", 1)
+        selector, prop = target.rsplit(".", 1)
     except ValueError:
         return rules
  

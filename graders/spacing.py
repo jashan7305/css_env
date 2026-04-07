@@ -27,7 +27,8 @@ def grade(html, css, tokens, state=None):
             return 0.0
         
         valid = sum(1 for n in nums if n in token_spacing) # counts the valida values 
-        
-        return float(valid / len(nums))
+
+        score = float(valid / len(nums))
+        return max(0.0, min(1.0, score))
     except Exception:
         return 0.0

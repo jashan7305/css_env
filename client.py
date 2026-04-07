@@ -12,7 +12,10 @@ from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
 
-from .models import CssAction, CssObservation
+try:
+    from .models import CssAction, CssObservation
+except ImportError:
+    from models import CssAction, CssObservation
 
 
 class CssEnv(
@@ -28,18 +31,18 @@ class CssEnv(
     Example:
         >>> # Connect to a running server
         >>> with CssEnv(base_url="http://localhost:8000") as client:
-        ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
+        ...     result = client.reset(task={"html": "<div class='card'></div>", "css": ".card{color:#1a6fe0;}", "tokens": {}, "config": {}}, seed=7)
+        ...     print(result.observation.css)
         ...
-        ...     result = client.step(CssAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
+        ...     result = client.step(CssAction(action_type="replace_color", target="#1a6fe0", value="#333333"))
+        ...     print(result.observation.css)
 
     Example with Docker:
         >>> # Automatically start container and connect
         >>> client = CssEnv.from_docker_image("css_env-env:latest")
         >>> try:
-        ...     result = client.reset()
-        ...     result = client.step(CssAction(message="Test"))
+        ...     result = client.reset(task={"html": "<div class='card'></div>", "css": ".card{color:#1a6fe0;}", "tokens": {}, "config": {}}, seed=7)
+        ...     result = client.step(CssAction(action_type="remove_rule", target=".unused", value=None))
         ... finally:
         ...     client.close()
     """
@@ -55,7 +58,9 @@ class CssEnv(
             Dictionary representation suitable for JSON encoding
         """
         return {
-            "message": action.message,
+            "action_type": action.action_type,
+            "target": action.target,
+            "value": action.value,
         }
 
     def _parse_result(self, payload: Dict) -> StepResult[CssObservation]:
@@ -70,11 +75,10 @@ class CssEnv(
         """
         obs_data = payload.get("observation", {})
         observation = CssObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
-            done=payload.get("done", False),
-            reward=payload.get("reward"),
-            metadata=obs_data.get("metadata", {}),
+            html=obs_data.get("html", ""),
+            css=obs_data.get("css", ""),
+            tokens=obs_data.get("tokens", {}),
+            violations=obs_data.get("violations"),
         )
 
         return StepResult(

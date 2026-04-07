@@ -16,6 +16,7 @@ def grade(html, css, tokens, state=None):
         normalized_colors = [normalize_hex(c) for c in colors]
         matches = sum(1 for c in normalized_colors if c in token_colors)
         
-        return float(matches / len(normalized_colors))
+        score = float(matches / len(normalized_colors))
+        return max(0.0, min(1.0, score))
     except Exception:
         return 0.0

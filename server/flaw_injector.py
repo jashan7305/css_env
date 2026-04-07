@@ -14,7 +14,7 @@ try:
         update_declaration,
     )
 except ImportError:
-    from css_parser import (
+    from server.css_parser import (
         get_declaration_map,
         get_qualified_rules,
         get_selector,
@@ -106,7 +106,7 @@ def inject_flaws(css: str, tokens: dict, config: dict, seed: int) -> dict:
 
 def _inject_wrong_colors(rules, tokens, config, rng, manifest):
     """Shift token-matching hex colors by a small seeded amount."""
-    token_colors = {c.lower() for c in tokens.get("colors", [])}
+    token_colors = {str(c).lower() for c in tokens.get("colors", {}).values()}
     intensity = config.get("intensity", 0.8)
 
     for rule in get_qualified_rules(rules):
@@ -166,7 +166,12 @@ def _shift_hex(hex_color: str, rng: random.Random) -> str:
 
 def _inject_bad_spacing(rules, tokens, config, rng, manifest):
     """Replace on-grid px spacing values with nearby off-grid values."""
+    spacing_values = sorted({int(v) for v in tokens.get("spacing", {}).values() if isinstance(v, (int, float))})
     unit = tokens.get("spacing_unit", 4)
+    if len(spacing_values) >= 2:
+        deltas = [b - a for a, b in zip(spacing_values, spacing_values[1:]) if b > a]
+        if deltas:
+            unit = min(deltas)
     off_grid = [v for v in range(3, 48) if v % unit != 0]
     intensity = config.get("intensity", 0.8)
 
