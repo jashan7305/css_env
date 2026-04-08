@@ -94,6 +94,7 @@ TASK = {
     "css": CLEAN_CSS,
     "design_tokens": TOKENS,
     "config": FLAW_CONFIG,
+    "graders": ["color", "spacing", "typography", "contrast", "cleanliness"],
     "grader_weights": GRADER_WEIGHTS,
     "max_steps": MAX_STEPS,
     "success_threshold": SUCCESS_THRESHOLD,

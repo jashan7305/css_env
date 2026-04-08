@@ -88,6 +88,41 @@ class _HttpCssEnv:
     async def close(self) -> None:
         await self._client.aclose()
 
+
+async def _is_env_reachable(base_url: str, timeout_s: float = 5.0) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
+            resp = await client.get(f"{base_url.rstrip('/')}/health")
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+async def _init_env() -> Any:
+    if ENV_BASE_URL:
+        env = _HttpCssEnv(base_url=ENV_BASE_URL)
+        return env
+
+    docker_error = ""
+    try:
+        return await CssEnv.from_docker_image(IMAGE_NAME)
+    except Exception as exc:
+        docker_error = str(exc)
+
+    fallbacks = [
+        "http://127.0.0.1:7860",
+        "http://localhost:7860",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+    ]
+    for candidate in fallbacks:
+        if await _is_env_reachable(candidate):
+            return _HttpCssEnv(base_url=candidate)
+
+    raise RuntimeError(
+        f"Unable to initialize environment. Docker init failed: {docker_error or 'unknown error'}"
+    )
+
 SYSTEM_PROMPT = textwrap.dedent(
     """
     You are a frontend engineer fixing CSS to match design tokens.
@@ -720,87 +755,110 @@ async def run_task(
     score = 0.0
 
     log_start(task=task_name, env="css_env", model=MODEL_NAME)
-    result = await env.reset(task=task_config, seed=7)
+    try:
+        result = await env.reset(task=task_config, seed=7)
+    except Exception as exc:
+        log_step(step=0, action={"action_type": "reset", "target": "", "value": None}, reward=0.0, done=True, error=f"reset_failed:{exc}")
+        log_end(success=False, steps=0, score=0.0, rewards=[])
+        return
 
-    for step in range(1, max_steps_for_task + 1):
-        action_payload = get_model_action(llm_client, step, result.observation, history)
-        if action_payload is None:
-            action_payload = choose_non_repeating_action(
+    try:
+        for step in range(1, max_steps_for_task + 1):
+            action_payload = get_model_action(llm_client, step, result.observation, history)
+            if action_payload is None:
+                action_payload = choose_non_repeating_action(
+                    result.observation,
+                    recent_action_signatures,
+                    success_threshold=success_threshold,
+                    avoid_action_type=last_action_type,
+                )
+
+            reward_decreased = bool(rewards) and (rewards[-1] < prev_reward)
+            if should_override_action(
                 result.observation,
+                action_payload,
                 recent_action_signatures,
                 success_threshold=success_threshold,
-                avoid_action_type=last_action_type,
-            )
+                reward_decreased=reward_decreased,
+                last_action_type=last_action_type,
+            ):
+                action_payload = choose_non_repeating_action(
+                    result.observation,
+                    recent_action_signatures,
+                    success_threshold=success_threshold,
+                    avoid_action_type=last_action_type if reward_decreased else "",
+                )
 
-        reward_decreased = bool(rewards) and (rewards[-1] < prev_reward)
-        if should_override_action(
-            result.observation,
-            action_payload,
-            recent_action_signatures,
-            success_threshold=success_threshold,
-            reward_decreased=reward_decreased,
-            last_action_type=last_action_type,
-        ):
-            action_payload = choose_non_repeating_action(
-                result.observation,
-                recent_action_signatures,
-                success_threshold=success_threshold,
-                avoid_action_type=last_action_type if reward_decreased else "",
-            )
+            error_val = "null"
+            try:
+                result = await env.step(CssAction(**action_payload))
+            except Exception as exc:
+                error_val = str(exc)
+                try:
+                    action_payload = choose_non_repeating_action(
+                        result.observation,
+                        recent_action_signatures,
+                        success_threshold=success_threshold,
+                    )
+                    result = await env.step(CssAction(**action_payload))
+                except Exception as exc2:
+                    log_step(step=step, action=action_payload, reward=0.0, done=True, error=f"step_failed:{exc2}")
+                    break
 
-        error_val = "null"
-        try:
-            result = await env.step(CssAction(**action_payload))
-        except Exception as exc:
-            error_val = str(exc)
-            action_payload = choose_non_repeating_action(
-                result.observation,
-                recent_action_signatures,
-                success_threshold=success_threshold,
-            )
-            result = await env.step(CssAction(**action_payload))
+            reward = clamp01(float(result.reward or 0.0))
+            done = bool(getattr(result, "done", False))
+            success = bool(getattr(result.observation, "success", False))
+            if not success and done:
+                success = reward >= success_threshold
 
-        reward = clamp01(float(result.reward or 0.0))
-        done = bool(getattr(result, "done", False))
-        success = bool(getattr(result.observation, "success", False))
-        if not success and done:
-            success = reward >= success_threshold
+            rewards.append(reward)
+            prev_reward = rewards[-2] if len(rewards) >= 2 else reward
+            steps_taken = step
+            recent_action_signatures.append(action_signature(action_payload))
+            last_action_type = str(action_payload.get("action_type", ""))
+            score = clamp01(float(getattr(result.observation, "score", score) or score))
 
-        rewards.append(reward)
-        prev_reward = rewards[-2] if len(rewards) >= 2 else reward
-        steps_taken = step
-        recent_action_signatures.append(action_signature(action_payload))
-        last_action_type = str(action_payload.get("action_type", ""))
-        score = clamp01(float(getattr(result.observation, "score", score) or score))
+            history.append(f"step={step} action={action_payload} reward={reward:.2f}")
+            log_step(step=step, action=action_payload, reward=reward, done=done, error=error_val)
 
-        history.append(f"step={step} action={action_payload} reward={reward:.2f}")
-        log_step(step=step, action=action_payload, reward=reward, done=done, error=error_val)
-
-        if done:
-            break
-
-    log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+            if done:
+                break
+    except Exception as exc:
+        log_step(step=max(steps_taken, 0), action={"action_type": "internal_error", "target": "", "value": None}, reward=0.0, done=True, error=str(exc))
+    finally:
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 async def main() -> None:
     llm_client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
     selected_tasks = select_tasks(TASK_NAME)
 
-    if ENV_BASE_URL:
-        env = _HttpCssEnv(base_url=ENV_BASE_URL)
-    else:
-        env = await CssEnv.from_docker_image(IMAGE_NAME)
+    env: Optional[Any] = None
+    try:
+        env = await _init_env()
+    except Exception as exc:
+        for task_name, _ in selected_tasks:
+            log_start(task=task_name, env="css_env", model=MODEL_NAME)
+            log_step(step=0, action={"action_type": "init", "target": "", "value": None}, reward=0.0, done=True, error=f"env_init_failed:{exc}")
+            log_end(success=False, steps=0, score=0.0, rewards=[])
+        return
 
     try:
         for task_name, task_config in selected_tasks:
-            await run_task(
-                env=env,
-                llm_client=llm_client,
-                task_name=task_name,
-                task_config=task_config,
-            )
+            try:
+                await run_task(
+                    env=env,
+                    llm_client=llm_client,
+                    task_name=task_name,
+                    task_config=task_config,
+                )
+            except Exception as exc:
+                log_start(task=task_name, env="css_env", model=MODEL_NAME)
+                log_step(step=0, action={"action_type": "task", "target": task_name, "value": None}, reward=0.0, done=True, error=f"task_failed:{exc}")
+                log_end(success=False, steps=0, score=0.0, rewards=[])
     finally:
-        await env.close()
+        if env is not None:
+            await env.close()
 
 
 if __name__ == "__main__":

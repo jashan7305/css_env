@@ -74,7 +74,7 @@ COPY --from=builder /app/env/tasks /app/env/tasks
 ENV PATH="/app/env/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Set PYTHONPATH so imports work correctly
-ENV PYTHONPATH="/app/env:$PYTHONPATH"
+ENV PYTHONPATH="/app/env"
 
 # API port required by the runtime platform
 EXPOSE 7860
