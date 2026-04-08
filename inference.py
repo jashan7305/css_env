@@ -3,13 +3,13 @@ import json
 import os
 import re
 import textwrap
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Tuple
 
 from openai import OpenAI
 
 from client import CssEnv
 from models import CssAction
-from tasks import TASKS
+from tasks import TASK_CONFIGS, TASK_ORDER
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
@@ -21,7 +21,7 @@ ENV_BASE_URL = os.getenv("ENV_BASE_URL", "")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "20"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "250"))
-SUCCESS_THRESHOLD = 0.95
+DEFAULT_SUCCESS_THRESHOLD = 0.95
 CURRENT_TASK_DIFFICULTY = "easy"
 
 SYSTEM_PROMPT = textwrap.dedent(
@@ -41,6 +41,10 @@ SYSTEM_PROMPT = textwrap.dedent(
     No markdown, no prose.
     """
 ).strip()
+
+
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
 
 def log_start(task: str, env: str, model: str) -> None:
@@ -141,103 +145,356 @@ def _extract_hex_colors(css: str) -> List[str]:
     return re.findall(r"#(?:[0-9a-fA-F]{3}){1,2}", css)
 
 
-def _candidate_actions(obs) -> List[Dict[str, Any]]:
-    scores = getattr(obs, "scores", None) or {}
-    tokens = getattr(obs, "tokens", {}) or {}
-    css = getattr(obs, "css", "")
+def _normalize_hex(color: str) -> str:
+    color = str(color).strip().lower()
+    if not color.startswith("#"):
+        return color
+    if len(color) == 4:
+        return "#" + "".join(ch * 2 for ch in color[1:])
+    return color
+
+
+def _parse_css_blocks(css: str) -> List[Tuple[str, Dict[str, str]]]:
+    blocks: List[Tuple[str, Dict[str, str]]] = []
+    for selector_group, body in re.findall(r"([^{}]+)\{([^{}]+)\}", css):
+        selectors = [s.strip() for s in selector_group.split(",") if s.strip() and not s.strip().startswith("@")]
+        decl_map: Dict[str, str] = {}
+        for declaration in body.split(";"):
+            if ":" not in declaration:
+                continue
+            prop, val = declaration.split(":", 1)
+            prop = prop.strip().lower()
+            val = val.strip()
+            if prop and val:
+                decl_map[prop] = val
+        if not decl_map:
+            continue
+        for selector in selectors:
+            blocks.append((selector, dict(decl_map)))
+    return blocks
+
+
+def _extract_selectors(css: str) -> List[str]:
+    selectors: List[str] = []
+    for selector, _ in _parse_css_blocks(css):
+        if selector not in selectors:
+            selectors.append(selector)
+    return selectors
+
+
+def _selector_matches_html(selector: str, html: str) -> bool:
+    base = re.split(r"::?|\s+|>|\+|~", selector.strip())[-1]
+    if not base or base == "*":
+        return True
+
+    if base.startswith("."):
+        class_name = base[1:]
+        return bool(re.search(rf'class\s*=\s*["\'][^"\']*\b{re.escape(class_name)}\b', html))
+
+    if base.startswith("#"):
+        element_id = base[1:]
+        return bool(re.search(rf'id\s*=\s*["\']{re.escape(element_id)}["\']', html))
+
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9-]*$", base):
+        return bool(re.search(rf"<{re.escape(base)}(?:\s|>)", html))
+
+    return False
+
+
+def _compute_unused_selectors(css: str, html: str) -> List[str]:
+    selectors = _extract_selectors(css)
+    unused = [selector for selector in selectors if not _selector_matches_html(selector, html)]
+    return sorted(set(unused))
+
+
+def _nearest_int(value: int, options: List[int]) -> int:
+    return min(options, key=lambda opt: abs(opt - value))
+
+
+def _first_hex(value: str) -> str:
+    matches = _extract_hex_colors(value or "")
+    return _normalize_hex(matches[0]) if matches else ""
+
+
+def _spacing_candidates(css: str, tokens: Dict[str, Any]) -> List[Dict[str, Any]]:
+    blocks = _parse_css_blocks(css)
+    spacing_tokens = sorted({int(v) for v in (tokens.get("spacing") or {}).values() if isinstance(v, (int, float))})
+    if not spacing_tokens:
+        return []
+
+    spacing_props = {
+        "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
+        "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
+        "gap", "row-gap", "column-gap",
+    }
+    px_re = re.compile(r"(\d+)px")
+    candidates: List[Dict[str, Any]] = []
+
+    for selector, decl_map in blocks:
+        for prop in spacing_props:
+            value = decl_map.get(prop)
+            if not value or "px" not in value:
+                continue
+
+            changed = False
+
+            def repl(match):
+                nonlocal changed
+                current = int(match.group(1))
+                nearest = _nearest_int(current, spacing_tokens)
+                if nearest != current:
+                    changed = True
+                return f"{nearest}px"
+
+            new_value = px_re.sub(repl, value)
+            if changed and new_value != value:
+                candidates.append({
+                    "action_type": "fix_spacing",
+                    "target": f"{selector}.{prop}",
+                    "value": new_value,
+                })
+
+    return candidates
+
+
+def _typography_candidates(css: str, tokens: Dict[str, Any]) -> List[Dict[str, Any]]:
+    blocks = _parse_css_blocks(css)
+    font_tokens = [str(v).strip() for v in (tokens.get("font_sizes") or []) if str(v).strip()]
+    line_tokens = [str(v).strip() for v in (tokens.get("line_heights") or []) if str(v).strip()]
+    font_px_tokens = [int(re.match(r"^(\d+)px$", token).group(1)) for token in font_tokens if re.match(r"^(\d+)px$", token)]
+    line_float_tokens = [float(token) for token in line_tokens if re.match(r"^\d+(?:\.\d+)?$", token)]
 
     candidates: List[Dict[str, Any]] = []
 
-    if scores.get("spacing", 1.0) < 0.95:
-        candidates.extend([
-            {"action_type": "fix_spacing", "target": ".card.margin", "value": "16px"},
-            {"action_type": "fix_spacing", "target": ".card.padding", "value": "16px"},
-        ])
+    for selector, decl_map in blocks:
+        font_size = decl_map.get("font-size")
+        if font_size and font_size.strip() not in font_tokens:
+            match = re.match(r"^(\d+)px$", font_size.strip())
+            if match and font_px_tokens:
+                nearest = _nearest_int(int(match.group(1)), font_px_tokens)
+                candidates.append({
+                    "action_type": "fix_typography",
+                    "target": f"{selector}.font-size",
+                    "value": f"{nearest}px",
+                })
 
-    if scores.get("color", 1.0) < 0.95:
-        token_colors = set((tokens.get("colors") or {}).values())
-        css_colors = _extract_hex_colors(css)
-        replacement_order = [
-            (tokens.get("colors") or {}).get("primary"),
-            (tokens.get("colors") or {}).get("text"),
-            "#333333",
-            "#1a6fe0",
-        ]
-        replacement_order = [c for c in replacement_order if c]
-        for src in css_colors:
-            if src in token_colors:
+        line_height = decl_map.get("line-height")
+        if line_height and line_height.strip() not in line_tokens and line_float_tokens:
+            match = re.match(r"^(\d+(?:\.\d+)?)$", line_height.strip())
+            if match:
+                current = float(match.group(1))
+                nearest = min(line_float_tokens, key=lambda opt: abs(opt - current))
+                candidates.append({
+                    "action_type": "fix_typography",
+                    "target": f"{selector}.line-height",
+                    "value": str(nearest),
+                })
+
+    return candidates
+
+
+def _contrast_ratio(fg_hex: str, bg_hex: str) -> float:
+    def to_rgb(color: str) -> Tuple[int, int, int]:
+        color = _normalize_hex(color).lstrip("#")
+        if len(color) == 3:
+            color = "".join(ch * 2 for ch in color)
+        if len(color) != 6:
+            return (0, 0, 0)
+        return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+    def luminance(rgb: Tuple[int, int, int]) -> float:
+        def channel(c: float) -> float:
+            c = c / 255.0
+            return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+        r, g, b = rgb
+        rr, gg, bb = channel(r), channel(g), channel(b)
+        return 0.2126 * rr + 0.7152 * gg + 0.0722 * bb
+
+    l1 = luminance(to_rgb(fg_hex))
+    l2 = luminance(to_rgb(bg_hex))
+    bright, dark = max(l1, l2), min(l1, l2)
+    return (bright + 0.05) / (dark + 0.05)
+
+
+def _contrast_candidates(css: str, tokens: Dict[str, Any]) -> List[Dict[str, Any]]:
+    blocks = _parse_css_blocks(css)
+    token_colors = tokens.get("colors") or {}
+    text_color = _normalize_hex(token_colors.get("text", "#333333"))
+    bg_color = _normalize_hex(token_colors.get("white", "#ffffff"))
+
+    candidates: List[Dict[str, Any]] = []
+    for selector, decl_map in blocks:
+        fg = _first_hex(decl_map.get("color", ""))
+        if not fg:
+            continue
+        bg = _first_hex(decl_map.get("background-color", "")) or _first_hex(decl_map.get("background", "")) or bg_color
+        if _contrast_ratio(fg, bg) < 4.5:
+            candidates.append({
+                "action_type": "fix_contrast",
+                "target": selector,
+                "value": f"{text_color},{bg_color}",
+            })
+
+    return candidates
+
+
+def _color_candidates(css: str, tokens: Dict[str, Any]) -> List[Dict[str, Any]]:
+    blocks = _parse_css_blocks(css)
+    token_colors_map = tokens.get("colors") or {}
+    token_colors = {_normalize_hex(v) for v in token_colors_map.values() if v}
+    if not token_colors:
+        return []
+
+    text_color = _normalize_hex(token_colors_map.get("text", "#333333"))
+    white_color = _normalize_hex(token_colors_map.get("white", "#ffffff"))
+    primary_color = _normalize_hex(token_colors_map.get("primary", text_color))
+
+    usage: Dict[str, Dict[str, int]] = {}
+    for _, decl_map in blocks:
+        for prop, value in decl_map.items():
+            if "color" not in prop and "background" not in prop and "border" not in prop:
                 continue
-            for dst in replacement_order:
-                if src != dst:
-                    candidates.append(
-                        {"action_type": "replace_color", "target": src, "value": dst}
-                    )
+            for found in _extract_hex_colors(value):
+                normalized = _normalize_hex(found)
+                if normalized in token_colors:
+                    continue
+                info = usage.setdefault(normalized, {"fg": 0, "bg": 0, "total": 0})
+                info["total"] += 1
+                if "background" in prop:
+                    info["bg"] += 1
+                else:
+                    info["fg"] += 1
 
-    if scores.get("typography", 1.0) < 0.95:
-        candidates.extend([
-            {"action_type": "fix_typography", "target": ".title.font-size", "value": "20px"},
-            {"action_type": "fix_typography", "target": ".text.font-size", "value": "16px"},
-            {"action_type": "fix_typography", "target": ".title.line-height", "value": "1.4"},
-        ])
+    candidates: List[Dict[str, Any]] = []
+    for source, info in sorted(usage.items(), key=lambda item: item[1]["total"], reverse=True):
+        replacement = white_color if info["bg"] > info["fg"] else text_color
+        if replacement == source:
+            replacement = primary_color if primary_color != source else white_color
+        if replacement != source:
+            candidates.append({
+                "action_type": "replace_color",
+                "target": source,
+                "value": replacement,
+            })
 
-    if scores.get("contrast", 1.0) < 0.95:
-        candidates.append(
-            {"action_type": "fix_contrast", "target": ".text", "value": "#333333,#ffffff"}
-        )
+    return candidates
 
-    if scores.get("layout", 1.0) < 0.95 and CURRENT_TASK_DIFFICULTY != "easy":
-        candidates.append(
-            {"action_type": "add_breakpoint", "target": "768px", "value": ".card { width: 100%; }"}
-        )
 
-    if scores.get("cleanliness", 1.0) < 0.95:
-        candidates.append(
-            {"action_type": "remove_rule", "target": ".unused", "value": None}
-        )
+def _cleanliness_candidates(css: str, html: str) -> List[Dict[str, Any]]:
+    return [
+        {"action_type": "remove_rule", "target": selector, "value": None}
+        for selector in _compute_unused_selectors(css, html)
+    ]
+
+
+def _layout_candidates(css: str) -> List[Dict[str, Any]]:
+    if "@media" in css or CURRENT_TASK_DIFFICULTY == "easy":
+        return []
+    selectors = _extract_selectors(css)
+    preferred = [".container", ".main", ".card", ".form", ".header"]
+    selected = next((selector for selector in preferred if selector in selectors), None)
+    if selected is None:
+        selected = next((selector for selector in selectors if selector.startswith(".")), ".container")
+    return [{
+        "action_type": "add_breakpoint",
+        "target": "768px",
+        "value": f"{selected} {{ width: 100%; }}",
+    }]
+
+
+def _dedupe_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set = set()
+    for action in actions:
+        safe = safe_action_dict(action)
+        sig = action_signature(safe)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        deduped.append(safe)
+    return deduped
+
+
+def _action_target_exists(obs, action_payload: Dict[str, Any]) -> bool:
+    css = getattr(obs, "css", "")
+    selectors = set(_extract_selectors(css))
+    action_type = action_payload.get("action_type", "")
+    target = str(action_payload.get("target", ""))
+
+    if action_type == "replace_color":
+        return target.lower() in css.lower()
+    if action_type == "remove_rule":
+        return target in selectors
+    if action_type in {"fix_spacing", "fix_typography"}:
+        if "." not in target:
+            return False
+        selector, _ = target.rsplit(".", 1)
+        return selector in selectors
+    if action_type == "fix_contrast":
+        return target in selectors
+    if action_type == "add_breakpoint":
+        return True
+    return False
+
+
+def _candidate_actions(obs, success_threshold: float) -> List[Dict[str, Any]]:
+    scores = getattr(obs, "scores", None) or {}
+    tokens = getattr(obs, "tokens", {}) or {}
+    css = getattr(obs, "css", "")
+    html = getattr(obs, "html", "")
+
+    metric_generators = {
+        "spacing": lambda: _spacing_candidates(css, tokens),
+        "color": lambda: _color_candidates(css, tokens),
+        "typography": lambda: _typography_candidates(css, tokens),
+        "contrast": lambda: _contrast_candidates(css, tokens),
+        "cleanliness": lambda: _cleanliness_candidates(css, html),
+        "layout": lambda: _layout_candidates(css),
+    }
+
+    candidates: List[Dict[str, Any]] = []
+
+    ordered_metrics = [
+        metric
+        for metric, metric_score in sorted(scores.items(), key=lambda kv: kv[1])
+        if metric in metric_generators and metric_score < success_threshold
+    ]
+
+    for metric in ordered_metrics:
+        candidates.extend(metric_generators[metric]())
 
     if not candidates:
-        if CURRENT_TASK_DIFFICULTY != "easy":
-            candidates.append(
-                {"action_type": "add_breakpoint", "target": "640px", "value": ".card { width: 100%; }"}
-            )
-        candidates.extend([
-            {"action_type": "fix_typography", "target": ".text.line-height", "value": "1.6"},
-            {"action_type": "remove_rule", "target": ".unused", "value": None},
-            default_fallback_action(),
-        ])
+        for metric in ["cleanliness", "spacing", "typography", "contrast", "color", "layout"]:
+            candidates.extend(metric_generators[metric]())
 
-    return [safe_action_dict(c) for c in candidates]
+    if not candidates:
+        candidates = [default_fallback_action()]
+
+    return _dedupe_actions(candidates)
 
 
 def choose_non_repeating_action(
     obs,
     seen_signatures: List[str],
+    success_threshold: float,
     avoid_action_type: str = "",
 ) -> Dict[str, Any]:
     blocked = set(seen_signatures)
     scores = getattr(obs, "scores", None) or {}
-    for candidate in _candidate_actions(obs):
+    for candidate in _candidate_actions(obs, success_threshold):
         sig = action_signature(candidate)
         if avoid_action_type and candidate.get("action_type") == avoid_action_type:
             continue
         score_key = _score_key_for_action_type(candidate.get("action_type", ""))
-        if score_key and scores.get(score_key, 0.0) >= SUCCESS_THRESHOLD:
+        if score_key and scores.get(score_key, 0.0) >= success_threshold:
             continue
         if sig not in blocked:
             return candidate
 
-    # Last-resort deterministic rotation to avoid an exact repeated signature.
-    fallback_pool = [
-        {"action_type": "fix_typography", "target": ".text.line-height", "value": "1.6"},
-        {"action_type": "remove_rule", "target": ".unused", "value": None},
-    ]
-    if CURRENT_TASK_DIFFICULTY != "easy":
-        fallback_pool.insert(
-            0,
-            {"action_type": "add_breakpoint", "target": "640px", "value": ".card { width: 100%; }"},
-        )
-    if scores.get("spacing", 0.0) < SUCCESS_THRESHOLD:
-        fallback_pool.append(default_fallback_action())
+    fallback_pool = _candidate_actions(obs, success_threshold)
+    if not fallback_pool:
+        fallback_pool = [default_fallback_action()]
 
     for candidate in [safe_action_dict(c) for c in fallback_pool]:
         if avoid_action_type and candidate.get("action_type") == avoid_action_type:
@@ -252,6 +509,7 @@ def should_override_action(
     obs,
     action_payload: Dict[str, Any],
     seen_signatures: List[str],
+    success_threshold: float,
     reward_decreased: bool = False,
     last_action_type: str = "",
 ) -> bool:
@@ -261,13 +519,16 @@ def should_override_action(
     if reward_decreased and last_action_type and action_payload.get("action_type") == last_action_type:
         return True
 
+    if not _action_target_exists(obs, action_payload):
+        return True
+
     sig = action_signature(action_payload)
     if sig in set(seen_signatures):
         return True
 
     scores = getattr(obs, "scores", None) or {}
     score_key = _score_key_for_action_type(action_payload.get("action_type", ""))
-    if score_key and scores.get(score_key, 0.0) >= SUCCESS_THRESHOLD:
+    if score_key and scores.get(score_key, 0.0) >= success_threshold:
         return True
 
     return False
@@ -294,92 +555,114 @@ def get_model_action(client: OpenAI, step: int, obs, history: List[str]) -> Dict
         return default_fallback_action()
 
 
-async def main() -> None:
-    global CURRENT_TASK_DIFFICULTY
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+def select_tasks(task_name_value: str) -> List[Tuple[str, Dict[str, Any]]]:
+    requested = task_name_value.lower()
+    aliases = {
+        "easy": "task1",
+        "medium": "task2",
+        "hard": "task3",
+    }
+    requested = aliases.get(requested, requested)
+    if requested == "all":
+        return [(name, TASK_CONFIGS[name]) for name in TASK_ORDER if name in TASK_CONFIGS]
+    if requested in TASK_CONFIGS:
+        return [(requested, TASK_CONFIGS[requested])]
+    raise ValueError(f"Unknown TASK_NAME: {task_name_value}. Expected one of: {','.join(TASK_CONFIGS.keys())},all")
 
-    if TASK_NAME.lower() == "all":
-        selected_tasks = list(TASKS.items())
-    else:
-        task_name = TASK_NAME if TASK_NAME in TASKS else "task1"
-        selected_tasks = [(task_name, TASKS[task_name])]
+
+async def run_task(
+    env: CssEnv,
+    llm_client: OpenAI,
+    task_name: str,
+    task_config: Dict[str, Any],
+) -> None:
+    global CURRENT_TASK_DIFFICULTY
+
+    CURRENT_TASK_DIFFICULTY = str(task_config.get("difficulty", "easy")).lower()
+    success_threshold = clamp01(float(task_config.get("success_threshold", DEFAULT_SUCCESS_THRESHOLD)))
+    max_steps_for_task = int(task_config.get("max_steps", MAX_STEPS))
+    max_steps_for_task = max(1, min(max_steps_for_task, MAX_STEPS))
+
+    history: List[str] = []
+    recent_action_signatures: List[str] = []
+    rewards: List[float] = []
+    prev_reward = 0.0
+    last_action_type = ""
+    steps_taken = 0
+    success = False
+    score = 0.0
+
+    log_start(task=task_name, env="css_env", model=MODEL_NAME)
+    result = await env.reset(task=task_config, seed=7)
+
+    for step in range(1, max_steps_for_task + 1):
+        action_payload = get_model_action(llm_client, step, result.observation, history)
+        reward_decreased = bool(rewards) and (rewards[-1] < prev_reward)
+        if should_override_action(
+            result.observation,
+            action_payload,
+            recent_action_signatures,
+            success_threshold=success_threshold,
+            reward_decreased=reward_decreased,
+            last_action_type=last_action_type,
+        ):
+            action_payload = choose_non_repeating_action(
+                result.observation,
+                recent_action_signatures,
+                success_threshold=success_threshold,
+                avoid_action_type=last_action_type if reward_decreased else "",
+            )
+
+        error_val = "null"
+        try:
+            result = await env.step(CssAction(**action_payload))
+        except Exception as exc:
+            error_val = str(exc)
+            action_payload = choose_non_repeating_action(
+                result.observation,
+                recent_action_signatures,
+                success_threshold=success_threshold,
+            )
+            result = await env.step(CssAction(**action_payload))
+
+        reward = clamp01(float(result.reward or 0.0))
+        done = reward >= success_threshold
+        success = done
+
+        rewards.append(reward)
+        prev_reward = rewards[-2] if len(rewards) >= 2 else reward
+        steps_taken = step
+        recent_action_signatures.append(action_signature(action_payload))
+        last_action_type = str(action_payload.get("action_type", ""))
+        score = clamp01(float(getattr(result.observation, "score", score) or score))
+
+        history.append(f"step={step} action={action_payload} reward={reward:.2f}")
+        log_step(step=step, action=action_payload, reward=reward, done=done, error=error_val)
+
+        if done:
+            break
+
+    log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+
+async def main() -> None:
+    llm_client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+    selected_tasks = select_tasks(TASK_NAME)
 
     if ENV_BASE_URL:
         env = CssEnv(base_url=ENV_BASE_URL)
     else:
         env = await CssEnv.from_docker_image(IMAGE_NAME)
 
-    for task_name, task in selected_tasks:
-        CURRENT_TASK_DIFFICULTY = str(task.get("difficulty", "easy")).lower()
-        history: List[str] = []
-        recent_action_signatures: List[str] = []
-        rewards: List[float] = []
-        prev_reward: float = 0.0
-        last_action_type: str = ""
-        steps_taken = 0
-        success = False
-        score = 0.0
-
-        log_start(task=task_name, env="css_env", model=MODEL_NAME)
-
-        try:
-            result = await env.reset(task=task, seed=7)
-
-            for step in range(1, MAX_STEPS + 1):
-                if result.done:
-                    break
-
-                action_payload = get_model_action(client, step, result.observation, history)
-                reward_decreased = bool(rewards) and (rewards[-1] < prev_reward)
-                if should_override_action(
-                    result.observation,
-                    action_payload,
-                    recent_action_signatures,
-                    reward_decreased=reward_decreased,
-                    last_action_type=last_action_type,
-                ):
-                    action_payload = choose_non_repeating_action(
-                        result.observation,
-                        recent_action_signatures,
-                        avoid_action_type=last_action_type if reward_decreased else "",
-                    )
-                action = CssAction(**action_payload)
-
-                error_val = "null"
-                try:
-                    result = await env.step(action)
-                except Exception as exc:
-                    error_val = str(exc)
-                    action_payload = choose_non_repeating_action(result.observation, recent_action_signatures)
-                    result = await env.step(CssAction(**action_payload))
-
-                reward = float(result.reward or 0.0)
-                rewards.append(reward)
-                if len(rewards) >= 2:
-                    prev_reward = rewards[-2]
-                else:
-                    prev_reward = reward
-                steps_taken = step
-                recent_action_signatures.append(action_signature(action_payload))
-                last_action_type = str(action_payload.get("action_type", ""))
-
-                score = float(getattr(result.observation, "score", score) or score)
-                score = max(0.0, min(1.0, score))
-
-                history.append(f"step={step} action={action_payload} reward={reward:.2f}")
-                log_step(step=step, action=action_payload, reward=reward, done=bool(result.done), error=error_val)
-
-                if result.done:
-                    success = bool(getattr(result.observation, "success", False))
-                    break
-
-            log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
-        finally:
-            # Keep env alive across tasks only when running all tasks.
-            if TASK_NAME.lower() != "all":
-                await env.close()
-
-    if TASK_NAME.lower() == "all":
+    try:
+        for task_name, task_config in selected_tasks:
+            await run_task(
+                env=env,
+                llm_client=llm_client,
+                task_name=task_name,
+                task_config=task_config,
+            )
+    finally:
         await env.close()
 
 

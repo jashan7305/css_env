@@ -1,6 +1,7 @@
 .git
 .gitignore
 .venv
+build
 __pycache__
 **/__pycache__
 *.pyc
@@ -10,3 +11,5 @@ openenv_css_env.egg-info
 .pytest_cache
 .mypy_cache
 .vscode
+*.log
+.env

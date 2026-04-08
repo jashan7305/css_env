@@ -42,19 +42,31 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         uv sync --no-editable; \
     fi
 
+# Ensure OpenEnv runtime is present in the environment venv.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /app/env/.venv/bin/python "openenv-core[core]>=0.2.1" && \
+    /app/env/.venv/bin/python -c "import openenv; print(openenv.__version__)"
+
 # Final runtime stage
 FROM ${BASE_IMAGE}
 
 WORKDIR /app
 
 # Copy the virtual environment from builder
-COPY --from=builder /app/env/.venv /app/.venv
+COPY --from=builder /app/env/.venv /app/env/.venv
 
-# Copy the environment code
-COPY --from=builder /app/env /app/env
+# Copy only runtime source files (avoid duplicating .venv inside /app/env)
+COPY --from=builder /app/env/__init__.py /app/env/__init__.py
+COPY --from=builder /app/env/client.py /app/env/client.py
+COPY --from=builder /app/env/models.py /app/env/models.py
+COPY --from=builder /app/env/reward.py /app/env/reward.py
+COPY --from=builder /app/env/openenv.yaml /app/env/openenv.yaml
+COPY --from=builder /app/env/server /app/env/server
+COPY --from=builder /app/env/graders /app/env/graders
+COPY --from=builder /app/env/tasks /app/env/tasks
 
 # Set PATH to use the virtual environment
-ENV PATH="/app/.venv/bin:$PATH"
+ENV PATH="/app/env/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Set PYTHONPATH so imports work correctly
 ENV PYTHONPATH="/app/env:$PYTHONPATH"
@@ -65,4 +77,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 # Run the FastAPI server
 # The module path is constructed to work with the /app/env structure
-CMD ["sh", "-c", "cd /app/env && uvicorn server.app:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "cd /app/env && /app/env/.venv/bin/uvicorn server.app:app --host 0.0.0.0 --port 8000"]

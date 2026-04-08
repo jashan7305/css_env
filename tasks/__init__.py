@@ -8,4 +8,7 @@ TASKS = {
     "task3": TASK3,
 }
 
-__all__ = ["TASKS", "TASK1", "TASK2", "TASK3"]
+TASK_CONFIGS = TASKS
+TASK_ORDER = ["task1", "task2", "task3"]
+
+__all__ = ["TASKS", "TASK_CONFIGS", "TASK_ORDER", "TASK1", "TASK2", "TASK3"]
