@@ -3,9 +3,19 @@ import json
 import os
 import re
 import textwrap
-from typing import Any, Dict, List, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 from openai import OpenAI
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
 
 from client import CssEnv
 from models import CssAction
@@ -23,6 +33,60 @@ TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "250"))
 DEFAULT_SUCCESS_THRESHOLD = 0.95
 CURRENT_TASK_DIFFICULTY = "easy"
+
+
+class _HttpCssEnv:
+    """Minimal async HTTP adapter for reset/step/state endpoints."""
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(timeout=60.0)
+
+    @staticmethod
+    def _parse_result(payload: Dict[str, Any]) -> Any:
+        obs_data = payload.get("observation", {}) or {}
+        observation = SimpleNamespace(
+            html=obs_data.get("html", ""),
+            css=obs_data.get("css", ""),
+            tokens=obs_data.get("tokens", {}) or {},
+            violations=obs_data.get("violations"),
+            scores=obs_data.get("scores") or {},
+            score=obs_data.get("score"),
+            success=obs_data.get("success"),
+            changed=obs_data.get("changed"),
+            no_op_action=obs_data.get("no_op_action"),
+            repeated_action=obs_data.get("repeated_action"),
+            terminated_by_max_steps=obs_data.get("terminated_by_max_steps"),
+            metadata=obs_data.get("metadata") or {},
+        )
+        return SimpleNamespace(
+            observation=observation,
+            reward=payload.get("reward"),
+            done=bool(payload.get("done", False)),
+        )
+
+    async def reset(self, task: Optional[Dict[str, Any]] = None, seed: int = 0) -> Any:
+        body: Dict[str, Any] = {"seed": seed}
+        if task is not None:
+            body["task"] = task
+        resp = await self._client.post(f"{self.base_url}/reset", json=body)
+        resp.raise_for_status()
+        return self._parse_result(resp.json())
+
+    async def step(self, action: CssAction) -> Any:
+        body = {
+            "action": {
+                "action_type": action.action_type,
+                "target": action.target,
+                "value": action.value,
+            }
+        }
+        resp = await self._client.post(f"{self.base_url}/step", json=body)
+        resp.raise_for_status()
+        return self._parse_result(resp.json())
+
+    async def close(self) -> None:
+        await self._client.aclose()
 
 SYSTEM_PROMPT = textwrap.dedent(
     """
@@ -116,11 +180,31 @@ def safe_action_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def default_fallback_action() -> Dict[str, Any]:
+def default_fallback_action(css: str, tokens: Dict[str, Any]) -> Dict[str, Any]:
+    selectors = _extract_selectors(css)
+    spacing_tokens = sorted(
+        {int(v) for v in (tokens.get("spacing") or {}).values() if isinstance(v, (int, float))}
+    )
+
+    if selectors and spacing_tokens:
+        mid_idx = len(spacing_tokens) // 2
+        return {
+            "action_type": "fix_spacing",
+            "target": f"{selectors[0]}.margin",
+            "value": f"{spacing_tokens[mid_idx]}px",
+        }
+
+    if selectors:
+        return {
+            "action_type": "remove_rule",
+            "target": selectors[-1],
+            "value": None,
+        }
+
     return {
-        "action_type": "fix_spacing",
-        "target": ".card.margin",
-        "value": "16px",
+        "action_type": "add_breakpoint",
+        "target": "768px",
+        "value": "body { width: 100%; }",
     }
 
 
@@ -423,7 +507,9 @@ def _action_target_exists(obs, action_payload: Dict[str, Any]) -> bool:
     target = str(action_payload.get("target", ""))
 
     if action_type == "replace_color":
-        return target.lower() in css.lower()
+        normalized_target = _normalize_hex(target)
+        css_colors = {_normalize_hex(color) for color in _extract_hex_colors(css)}
+        return normalized_target in css_colors
     if action_type == "remove_rule":
         return target in selectors
     if action_type in {"fix_spacing", "fix_typography"}:
@@ -436,6 +522,33 @@ def _action_target_exists(obs, action_payload: Dict[str, Any]) -> bool:
     if action_type == "add_breakpoint":
         return True
     return False
+
+
+def _action_payload_is_well_formed(action_payload: Dict[str, Any]) -> bool:
+    action_type = str(action_payload.get("action_type", ""))
+    target = str(action_payload.get("target", "")).strip()
+    value = action_payload.get("value")
+
+    if action_type == "replace_color":
+        return bool(re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", target)) and isinstance(value, str)
+    if action_type in {"fix_spacing", "fix_typography"}:
+        return "." in target and isinstance(value, str) and bool(value.strip())
+    if action_type == "fix_contrast":
+        return isinstance(value, str) and "," in value
+    if action_type == "add_breakpoint":
+        return bool(re.fullmatch(r"\d+px", target)) and isinstance(value, str) and "{" in value and "}" in value
+    if action_type == "remove_rule":
+        return bool(target)
+    return False
+
+
+def _action_matches_candidates(obs, action_payload: Dict[str, Any], success_threshold: float) -> bool:
+    candidates = _candidate_actions(obs, success_threshold)
+    if not candidates:
+        return True
+    sig = action_signature(safe_action_dict(action_payload))
+    candidate_sigs = {action_signature(candidate) for candidate in candidates}
+    return sig in candidate_sigs
 
 
 def _candidate_actions(obs, success_threshold: float) -> List[Dict[str, Any]]:
@@ -469,7 +582,7 @@ def _candidate_actions(obs, success_threshold: float) -> List[Dict[str, Any]]:
             candidates.extend(metric_generators[metric]())
 
     if not candidates:
-        candidates = [default_fallback_action()]
+        candidates = [default_fallback_action(css, tokens)]
 
     return _dedupe_actions(candidates)
 
@@ -494,7 +607,7 @@ def choose_non_repeating_action(
 
     fallback_pool = _candidate_actions(obs, success_threshold)
     if not fallback_pool:
-        fallback_pool = [default_fallback_action()]
+        fallback_pool = [default_fallback_action(getattr(obs, "css", ""), getattr(obs, "tokens", {}) or {})]
 
     for candidate in [safe_action_dict(c) for c in fallback_pool]:
         if avoid_action_type and candidate.get("action_type") == avoid_action_type:
@@ -502,7 +615,15 @@ def choose_non_repeating_action(
         if action_signature(candidate) not in blocked:
             return candidate
 
-    return safe_action_dict(fallback_pool[0])
+    usage_counts: Dict[str, int] = {}
+    for seen_sig in seen_signatures:
+        usage_counts[seen_sig] = usage_counts.get(seen_sig, 0) + 1
+
+    ranked = sorted(
+        [safe_action_dict(candidate) for candidate in fallback_pool],
+        key=lambda candidate: usage_counts.get(action_signature(candidate), 0),
+    )
+    return ranked[0]
 
 
 def should_override_action(
@@ -519,7 +640,13 @@ def should_override_action(
     if reward_decreased and last_action_type and action_payload.get("action_type") == last_action_type:
         return True
 
+    if not _action_payload_is_well_formed(action_payload):
+        return True
+
     if not _action_target_exists(obs, action_payload):
+        return True
+
+    if not _action_matches_candidates(obs, action_payload, success_threshold):
         return True
 
     sig = action_signature(action_payload)
@@ -534,7 +661,7 @@ def should_override_action(
     return False
 
 
-def get_model_action(client: OpenAI, step: int, obs, history: List[str]) -> Dict[str, Any]:
+def get_model_action(client: OpenAI, step: int, obs, history: List[str]) -> Optional[Dict[str, Any]]:
     scores = getattr(obs, "scores", None) or {}
     prompt = build_user_prompt(step, obs.html, obs.css, obs.tokens, obs.violations, scores, history)
     try:
@@ -552,7 +679,7 @@ def get_model_action(client: OpenAI, step: int, obs, history: List[str]) -> Dict
         parsed = json.loads(text)
         return safe_action_dict(parsed)
     except Exception:
-        return default_fallback_action()
+        return None
 
 
 def select_tasks(task_name_value: str) -> List[Tuple[str, Dict[str, Any]]]:
@@ -597,6 +724,14 @@ async def run_task(
 
     for step in range(1, max_steps_for_task + 1):
         action_payload = get_model_action(llm_client, step, result.observation, history)
+        if action_payload is None:
+            action_payload = choose_non_repeating_action(
+                result.observation,
+                recent_action_signatures,
+                success_threshold=success_threshold,
+                avoid_action_type=last_action_type,
+            )
+
         reward_decreased = bool(rewards) and (rewards[-1] < prev_reward)
         if should_override_action(
             result.observation,
@@ -626,8 +761,10 @@ async def run_task(
             result = await env.step(CssAction(**action_payload))
 
         reward = clamp01(float(result.reward or 0.0))
-        done = reward >= success_threshold
-        success = done
+        done = bool(getattr(result, "done", False))
+        success = bool(getattr(result.observation, "success", False))
+        if not success and done:
+            success = reward >= success_threshold
 
         rewards.append(reward)
         prev_reward = rewards[-2] if len(rewards) >= 2 else reward
@@ -650,7 +787,7 @@ async def main() -> None:
     selected_tasks = select_tasks(TASK_NAME)
 
     if ENV_BASE_URL:
-        env = CssEnv(base_url=ENV_BASE_URL)
+        env = _HttpCssEnv(base_url=ENV_BASE_URL)
     else:
         env = await CssEnv.from_docker_image(IMAGE_NAME)
 

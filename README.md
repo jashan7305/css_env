@@ -1,175 +1,85 @@
-# css_env
+---
+title: BitWise CSS Env
+emoji: 🐠
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+short_description: Design System Alignment RL Environment
+---
 
-Deterministic OpenEnv benchmark for iterative CSS refinement.
+# BitWise CSS: Design System Alignment Environment
 
-## Motivation
+## Space Metadata Summary
 
-Modern AI systems generate CSS that is syntactically valid but visually poor. This environment benchmarks whether an agent can fix structured design defects (tokens, spacing, typography, contrast, responsiveness, cleanup) through constrained semantic actions.
+| Field | Value |
+| --- | --- |
+| **SDK** | Docker |
+| **Port** | 7860 |
+| **Topic** | Design System Alignment RL |
 
-## Environment Loop
+## Overview
+BitWise CSS is a Reinforcement Learning (RL) environment designed to fix a core problem in AI-assisted coding: **visually poor CSS**. While LLMs generate syntactically correct code, they often ignore design tokens, break accessibility, and create redundant rules.
 
-1. reset() loads task HTML + token spec + clean CSS.
-2. Flaw injector programmatically injects realistic defects.
-3. Agent receives observation: html, css, tokens, violations (easy only).
-4. Agent sends structured action.
-5. step(action) applies mutation, runs deterministic graders, computes reward.
-6. Episode ends on success (all grader scores >= 0.95) or max steps.
+This environment challenges agents to iteratively transform "flawed" CSS into code that perfectly aligns with a provided **Design Token Specification**. All grading is deterministic and based on mathematical compliance, not subjective LLM judgment.
 
-No LLM-based grading is used.
+---
 
-## Data Contracts
+## Architecture Summary
+The environment follows a standard RL loop:
+1. **`reset()`**: Loads an HTML fixture and Design Tokens. A **Flaw Injector** programmatically creates realistic CSS errors. Returns the initial **Observation**.
+2. **`step(action)`**: The agent applies a **Structured Action** (e.g., `replace_color`, `fix_spacing`).
+3. **Reward**: The environment computes a dense reward based on the delta of compliance scores across five categories: Color, Spacing, Typography, Contrast, and Cleanliness.
+4. **Termination**: Ends when all scores exceed **0.95** or `max_steps` is reached.
+
+---
+
+## Tasks & Difficulty
+| Task | Level | Focus | Difficulty Drivers |
+| :--- | :--- | :--- | :--- |
+| **Task 1** | **Easy** | Token Alignment | Explicit violation hints provided. |
+| **Task 2** | **Medium** | Accessibility & Typography | Hints absent; requires diagnostic reasoning. |
+| **Task 3** | **Hard** | Layout & Code Cleanup | Requires media query logic and pruning. |
+
+---
+
+## Data Models
 
 ### Observation
+- **HTML**: Component structure (string).
+- **CSS**: Current stylesheet (string).
+- **Design Tokens**: Allowed colors, spacing grid (4px/8px), font-scale, and breakpoints.
+- **Violations**: Explicit list of errors (Easy task only).
 
-- html: string
-- css: string
-- tokens: dict
-- violations: optional list[dict[str, str]] (easy task only)
+### Action (Structured Edits)
+*Raw CSS string editing is prohibited.* Agents must use:
+- `replace_color`: Target selector/property to match tokens.
+- `fix_spacing`: Snap values to the 4px/8px grid.
+- `fix_typography`: Align font-size/line-height to type scales.
+- `fix_contrast`: Adjust foreground/background pairs for WCAG AA.
+- `add_breakpoint`: Inject media queries with fluid layout rules.
+- `remove_rule`: Clean up unused selectors.
 
-### Action
+### Reward Function
+Dense rewards are computed as a weighted sum:
+$$Reward = 0.30(Color) + 0.20(Spacing) + 0.20(Typography) + 0.20(Contrast) + 0.10(Clean)$$
+- **Penalty**: $-0.05$ for unnecessary or no-op actions.
+- **Bonus**: $+0.50$ for reaching the $0.95$ success threshold.
 
-- action_type: one of
-  - replace_color
-  - fix_spacing
-  - fix_typography
-  - fix_contrast
-  - add_breakpoint
-  - remove_rule
-- target: string
-- value: string or null
+---
 
-### Grader Signature
-
-All graders implement:
-
-- grade(html: str, css: str, tokens: dict, state: dict | None = None) -> float
-
-All scores are clamped to [0.0, 1.0].
-
-## Reward
-
-Per-step dense reward:
-
-- 0.30 * color
-- 0.20 * spacing
-- 0.20 * typography
-- 0.20 * contrast
-- 0.10 * cleanliness
-- -0.05 penalty for no-op/unnecessary actions
-
-Terminal bonus:
-
-- +0.50 when episode is done and all grader scores >= 0.95
-
-## Tasks
-
-Defined in:
-
-- tasks/task1.py
-- tasks/task2.py
-- tasks/task3.py
-
-Each task declares:
-
-- HTML fixture
-- clean CSS baseline
-- design tokens
-- flaw config
-- grader weights metadata
-- max steps
-- success threshold
-- optional violations (easy task)
-
-## Graders
-
-- graders/colors.py
-- graders/spacing.py
-- graders/typography.py
-- graders/contrast.py
-- graders/layout.py
-- graders/cleanliness.py
-- graders/design_quality.py
-
-Unit tests:
-
-- scripts/test_graders_unit.py
-
-Verification harness:
-
-- scripts/tasks_and_verification.py
-
-## Run Locally
-
-Create environment and install:
-
+## Quick Start for Testing
 ```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install .
-```
+# Set required variables
+export ENV_BASE_URL="[https://ar-srivas-bitwise-css-env.hf.space](https://ar-srivas-bitwise-css-env.hf.space)"
+export API_BASE_URL="[https://router.huggingface.co/v1](https://router.huggingface.co/v1)"
+export MODEL_NAME="Qwen/Qwen2.5-72B-Instruct"
+export HF_TOKEN="your_token_here"
 
-Run server:
+# Run smoke tests
+curl -i $ENV_BASE_URL/health
+curl -i -X POST $ENV_BASE_URL/reset -H "Content-Type: application/json" -d '{}'
 
-```bash
-uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Run verification:
-
-```bash
-python scripts/tasks_and_verification.py
-python scripts/test_graders_unit.py
-```
-
-## Docker
-
-Root Dockerfile is validator-compatible.
-
-```bash
-docker build -t css_env-env:latest .
-docker run --rm -p 8000:8000 css_env-env:latest
-```
-
-## Inference Script Requirements
-
-Submission script is:
-
-- inference.py (root)
-
-Required environment variables:
-
-- API_BASE_URL
-- MODEL_NAME
-- HF_TOKEN
-
-LLM calls use OpenAI Client with those variables.
-
-The script prints strict structured logs:
-
-- [START]
-- [STEP]
-- [END]
-
-Example run:
-
-```bash
-API_BASE_URL=https://api.openai.com/v1 MODEL_NAME=gpt-4o-mini HF_TOKEN=... python inference.py
-```
-
-## HF Space and Validation
-
-OpenEnv manifest:
-
-- openenv.yaml
-
-Run pre-validation before submission:
-
-```bash
-bash scripts/validate-submission.sh https://your-space.hf.space .
-```
-
-Validation checks:
-
-1. Space responds to POST /reset with HTTP 200
-2. Docker build succeeds
-3. openenv validate passes
+# Run baseline inference
+python inference.py

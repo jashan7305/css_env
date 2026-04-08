@@ -1,11 +1,11 @@
-ARG BASE_IMAGE=ghcr.io/meta-pytorch/openenv-base:latest
+ARG BASE_IMAGE=python:3.10-slim
 FROM ${BASE_IMAGE} AS builder
 
 WORKDIR /app
 
 # Ensure git is available (required for installing dependencies from VCS)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git && \
+    apt-get install -y --no-install-recommends git curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Build argument to control whether we're building standalone or in-repo
@@ -52,6 +52,11 @@ FROM ${BASE_IMAGE}
 
 WORKDIR /app
 
+# Install curl for health checks
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy the virtual environment from builder
 COPY --from=builder /app/env/.venv /app/env/.venv
 
@@ -71,10 +76,13 @@ ENV PATH="/app/env/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/
 # Set PYTHONPATH so imports work correctly
 ENV PYTHONPATH="/app/env:$PYTHONPATH"
 
+# API port required by the runtime platform
+EXPOSE 7860
+
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:7860/health || exit 1
 
 # Run the FastAPI server
 # The module path is constructed to work with the /app/env structure
-CMD ["sh", "-c", "cd /app/env && /app/env/.venv/bin/uvicorn server.app:app --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "cd /app/env && /app/env/.venv/bin/uvicorn server.app:app --host 0.0.0.0 --port 7860"]
