@@ -19,7 +19,7 @@ try:
 except Exception:  # pragma: no cover
     compile_selector_list = None
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -343,15 +343,17 @@ async def get_schemas() -> SchemaResponse:
 
 
 @app.post("/reset", response_model=ResetResponse)
-async def reset(request: ResetRequest) -> ResetResponse:
+async def reset(request: Optional[Dict[str, Any]] = Body(default=None)) -> ResetResponse:
     global _CURRENT_TASK_NAME
 
-    task_name, task = _resolve_task(request)
+    request_model = ResetRequest.model_validate(request or {})
+
+    task_name, task = _resolve_task(request_model)
     _CURRENT_TASK_NAME = task_name
 
-    observation = _ENV.reset(task=task, seed=request.seed)
+    observation = _ENV.reset(task=task, seed=request_model.seed)
     _ENV.state_data["task_name"] = task_name
-    _ENV.state_data["seed"] = request.seed
+    _ENV.state_data["seed"] = request_model.seed
 
     return ResetResponse(observation=observation, reward=None, done=False)
 
@@ -423,7 +425,7 @@ async def step(request: StepRequest) -> StepResponse:
 
 
 @app.get("/state")
-async def endpoint_state() -> State:
+async def endpoint_state() -> Any:
     return _ENV.state
 
 
