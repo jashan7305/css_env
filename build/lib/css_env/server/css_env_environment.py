@@ -410,14 +410,14 @@ class CssEnvironment(Environment):
         }
 
     def _is_done(self, scores: Dict[str, float]) -> bool:
-        # Only check graders that contribute to the reward calculation.
-        # This ensures consistency between reward signals and success condition.
         required = [
             "color",
             "spacing",
             "typography",
             "contrast",
+            "layout",
             "cleanliness",
+            "design_quality",
         ]
         return all(scores.get(key, 0.0) >= self.success_threshold for key in required)
 
