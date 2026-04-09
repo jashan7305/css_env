@@ -1,53 +1,27 @@
 HTML = """
-<div class="container">
-    <header class="header">
-        <h1 class="logo">App</h1>
-        <nav class="nav"></nav>
+<section class="landing">
+    <header class="hero">
+        <h1 class="hero-title">Design Systems</h1>
+        <p class="hero-copy">Build interfaces that scale cleanly across screens.</p>
     </header>
-    <main class="main">
-        <section class="hero">
-            <h2 class="hero-title">Welcome</h2>
-            <p class="hero-text">Get started</p>
-        </section>
-        <section class="features">
-            <div class="feature">Feature 1</div>
-            <div class="feature">Feature 2</div>
-        </section>
-    </main>
-</div>
+    <div class="stats">
+        <article class="stat">Speed</article>
+        <article class="stat">Consistency</article>
+        <article class="stat">Accessibility</article>
+    </div>
+</section>
 """
 
 CLEAN_CSS = """
-.container {
+.landing {
     width: 100%;
-    padding: 16px;
-    margin: 16px;
-}
-
-.header {
-    width: 100%;
-    display: grid;
-    gap: 16px;
-}
-
-.logo {
-    font-size: 24px;
-    line-height: 1.4;
-    color: #1a6fe0;
-}
-
-.nav {
-    width: 100%;
-}
-
-.main {
-    width: 100%;
-    padding: 16px;
+    padding: 24px;
     margin: 16px;
 }
 
 .hero {
     width: 100%;
+    margin-bottom: 24px;
 }
 
 .hero-title {
@@ -56,22 +30,43 @@ CLEAN_CSS = """
     color: #1a6fe0;
 }
 
-.hero-text {
+.hero-copy {
     font-size: 16px;
     line-height: 1.6;
     color: #333333;
 }
 
-.features {
-    display: flex;
+.stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
     gap: 16px;
-    padding: 16px;
 }
 
-.feature {
+.stat {
+    padding: 16px;
     font-size: 18px;
-    line-height: 1.6;
+    line-height: 1.4;
     color: #333333;
+    background-color: #ffffff;
+}
+
+@media (max-width: 768px) {
+    .stats {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        width: 100%;
+    }
+}
+
+@media (max-width: 480px) {
+    .stats {
+        grid-template-columns: 1fr;
+        width: 100%;
+    }
+
+    .hero-copy {
+        font-size: 14px;
+    }
 }
 """
 
@@ -102,24 +97,25 @@ FLAW_CONFIG = {
     "unused_rules": True,
 }
 
-MAX_STEPS = 20
-SUCCESS_THRESHOLD = 0.95
+MAX_STEPS = 16
+SUCCESS_THRESHOLD = 0.90
 GRADER_WEIGHTS = {
-    "color": 0.30,
+    "color": 0.25,
     "spacing": 0.20,
     "typography": 0.20,
-    "contrast": 0.20,
+    "contrast": 0.15,
+    "layout": 0.10,
     "cleanliness": 0.10,
 }
 
 TASK = {
-    "name": "Complex Layout With Multiple Flaws",
-    "difficulty": "hard",
+    "name": "Responsive Landing Metrics",
+    "difficulty": "medium",
     "html": HTML,
     "css": CLEAN_CSS,
     "design_tokens": TOKENS,
     "config": FLAW_CONFIG,
-    "graders": ["color", "spacing", "typography", "contrast", "cleanliness", "layout"],
+    "graders": ["color", "spacing", "typography", "contrast", "layout", "cleanliness"],
     "grader_weights": GRADER_WEIGHTS,
     "max_steps": MAX_STEPS,
     "success_threshold": SUCCESS_THRESHOLD,

@@ -42,6 +42,7 @@ _GRADIENT_RE = re.compile(r"(linear|radial|conic)-gradient", re.IGNORECASE)
 _HEX_RE = re.compile(r"#([0-9a-fA-F]{3,8})\b")
 _PX_VALUE_RE = re.compile(r"\b(\d+)px\b")
 _REM_VALUE_RE = re.compile(r"\b(\d+(?:\.\d+)?)rem\b")
+_FONT_PX_RE = re.compile(r"\b(\d+)px\b")
 
 _UNUSED_RULE_POOL = [
     ".tooltip-inner", ".tooltip-arrow", ".popover-body", ".popover-header",
@@ -69,7 +70,6 @@ _FILLER_DECLARATIONS = [
 
 def inject_flaws(css: str, tokens: dict, config: dict, seed: int) -> dict:
     """Inject flaws into clean CSS and return flawed css, manifest, and hints."""
-    random.seed(seed)
     rng = random.Random(seed)
 
     rules = parse_css(css)
@@ -226,12 +226,12 @@ def _inject_wrong_typography(rules, tokens, config, rng, manifest):
             if prop in _FONT_SIZE_PROPS:
                 if rng.random() >= intensity:
                     continue
-                match = _REM_VALUE_RE.search(val)
-                if not match or match.group(0) not in font_sizes:
+                if val not in font_sizes:
                     continue
 
-                new_rem = _shift_rem(float(match.group(1)), font_sizes, rng)
-                new_val = val.replace(match.group(0), new_rem)
+                new_val = _shift_font_size(val, font_sizes, rng)
+                if new_val == val:
+                    continue
                 update_declaration(rule, prop, new_val)
                 manifest.append({
                     "flaw_type": "wrong_typography",
@@ -262,6 +262,37 @@ def _inject_wrong_typography(rules, tokens, config, rng, manifest):
                     "injected": new_val,
                     "description": f"'line-height' on '{selector}' is '{new_val}', not a token value (original: '{val}').",
                 })
+
+
+def _shift_font_size(original_value: str, font_sizes: list, rng: random.Random) -> str:
+    """Shift a token font-size value to a nearby off-scale value."""
+    px_match = _FONT_PX_RE.search(original_value)
+    if px_match:
+        original_px = int(px_match.group(1))
+        token_px = {
+            int(m.group(1))
+            for fs in font_sizes
+            for m in [_FONT_PX_RE.search(str(fs))]
+            if m
+        }
+
+        candidates = [
+            v for v in range(max(8, original_px - 4), original_px + 5)
+            if v not in token_px and v > 0
+        ]
+        if not candidates:
+            candidates = [v for v in range(9, 41) if v not in token_px]
+        if not candidates:
+            return original_value
+
+        replacement = f"{rng.choice(candidates)}px"
+        return original_value.replace(px_match.group(0), replacement, 1)
+
+    rem_match = _REM_VALUE_RE.search(original_value)
+    if rem_match:
+        return original_value.replace(rem_match.group(0), _shift_rem(float(rem_match.group(1)), font_sizes, rng), 1)
+
+    return original_value
 
 
 def _shift_rem(original: float, font_sizes: list, rng: random.Random) -> str:

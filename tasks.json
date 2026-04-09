@@ -1,0 +1,33 @@
+{
+  "tasks": [
+    {
+      "task_id": "task1",
+      "description": "Easy: align card component colors, spacing, and cleanliness to design tokens.",
+      "grader_id": "bitwise_css_easy"
+    },
+    {
+      "task_id": "task2",
+      "description": "Medium: fix navbar typography, contrast, and color compliance.",
+      "grader_id": "bitwise_css_medium"
+    },
+    {
+      "task_id": "task3",
+      "description": "Hard: repair dashboard layout, spacing, typography, contrast, and cleanup issues.",
+      "grader_id": "bitwise_css_hard"
+    }
+  ],
+  "graders": {
+    "bitwise_css_easy": {
+      "type": "deterministic",
+      "entrypoint": "graders.task_graders:bitwise_css_easy"
+    },
+    "bitwise_css_medium": {
+      "type": "deterministic",
+      "entrypoint": "graders.task_graders:bitwise_css_medium"
+    },
+    "bitwise_css_hard": {
+      "type": "deterministic",
+      "entrypoint": "graders.task_graders:bitwise_css_hard"
+    }
+  }
+}

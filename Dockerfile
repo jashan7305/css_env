@@ -66,9 +66,9 @@ COPY --from=builder /app/env/client.py /app/env/client.py
 COPY --from=builder /app/env/models.py /app/env/models.py
 COPY --from=builder /app/env/reward.py /app/env/reward.py
 COPY --from=builder /app/env/openenv.yaml /app/env/openenv.yaml
+COPY --from=builder /app/env/tasks.py /app/env/tasks.py
 COPY --from=builder /app/env/server /app/env/server
 COPY --from=builder /app/env/graders /app/env/graders
-COPY --from=builder /app/env/tasks /app/env/tasks
 
 # Set PATH to use the virtual environment
 ENV PATH="/app/env/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

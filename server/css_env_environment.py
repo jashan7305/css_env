@@ -21,16 +21,21 @@ try:
     from ..models import CssAction, CssObservation
     from ..reward import compute_reward
     from ..graders import colors, spacing, typography, contrast, layout, cleanliness, design_quality
-    from ..tasks import TASKS
+    from ..graders.task_graders import TASK_GRADERS
+    from .tasks import TASKS
     from .action_engine import apply_action
     from .flaw_injector import inject_flaws
 except ImportError:
     from models import CssAction, CssObservation
     from reward import compute_reward
     from graders import colors, spacing, typography, contrast, layout, cleanliness, design_quality
-    from tasks import TASKS
+    from graders.task_graders import TASK_GRADERS
+    from server.tasks import TASKS
     from server.action_engine import apply_action
     from server.flaw_injector import inject_flaws
+
+
+TASK_GRADER_REGISTRY = TASK_GRADERS
 
 
 class CssEnvironment(Environment):
@@ -72,6 +77,7 @@ class CssEnvironment(Environment):
         self.manifest = [] # list of dicts describing flaws
         self.difficulty = "easy"
         self.success_threshold = 0.95
+        self.required_graders = ["color", "spacing", "typography", "contrast", "cleanliness"]
         self.step_count = 0 # current step count
         self.max_steps = 20 # maximum steps
         self.state_data = {} # tracks progress
@@ -126,6 +132,11 @@ class CssEnvironment(Environment):
             self.difficulty = task.get("difficulty", "easy")
             self.max_steps = int(task.get("max_steps", self.max_steps))
             self.success_threshold = float(task.get("success_threshold", 0.95))
+            required_graders = task.get("graders", self.required_graders)
+            if isinstance(required_graders, list) and required_graders:
+                self.required_graders = [str(k) for k in required_graders]
+            else:
+                self.required_graders = ["color", "spacing", "typography", "contrast", "cleanliness"]
 
             clean_css = task.get("css", task.get("clean_css", ""))
 
@@ -156,6 +167,7 @@ class CssEnvironment(Environment):
                 "last_no_op": False,
                 "last_irrelevant": False,
                 "action_counts": {},
+                "required_graders": list(self.required_graders),
             }
 
             self.state_data["last_scores"] = self._run_graders()
@@ -410,15 +422,9 @@ class CssEnvironment(Environment):
         }
 
     def _is_done(self, scores: Dict[str, float]) -> bool:
-        # Only check graders that contribute to the reward calculation.
-        # This ensures consistency between reward signals and success condition.
-        required = [
-            "color",
-            "spacing",
-            "typography",
-            "contrast",
-            "cleanliness",
-        ]
+        required = list(self.state_data.get("required_graders") or self.required_graders)
+        if not required:
+            required = ["color", "spacing", "typography", "contrast", "cleanliness"]
         return all(scores.get(key, 0.0) >= self.success_threshold for key in required)
 
     def _safe_grade(self, grader_fn) -> float:

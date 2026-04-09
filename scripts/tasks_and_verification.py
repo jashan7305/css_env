@@ -7,7 +7,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from graders import colors, spacing, typography, contrast, layout, cleanliness, design_quality
 from reward import compute_reward
 from server.flaw_injector import inject_flaws
-from tasks import TASKS
+try:
+    from server.tasks import TASKS
+except ImportError:
+    from tasks import TASKS
 
 
 GRADER_KEYS = [

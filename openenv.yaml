@@ -1,7 +1,143 @@
 spec_version: 1
 name: css_env
-type: space
-runtime: fastapi
-app: server.app:app
-port: 7860
+description: "CSS Design Token Refinement — fix color, spacing, typography, contrast, layout, and cleanliness violations using design tokens"
+version: "1.0.0"
+author: "BitWise Team"
 
+endpoints:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+  grade: GET /grade
+
+tasks:
+  - id: task1
+    name: task1
+    difficulty: easy
+    description: "Easy: fix color, spacing, and typography violations in a simple card component"
+    config_module: server.tasks
+    graders:
+      - color
+      - spacing
+      - cleanliness
+
+  - id: task2
+    name: task2
+    difficulty: medium
+    description: "Medium: fix color, spacing, typography, contrast, and cleanliness violations in a form component"
+    config_module: server.tasks
+    graders:
+      - color
+      - typography
+      - contrast
+
+  - id: task3
+    name: task3
+    difficulty: hard
+    description: "Hard: fix all violation types including layout and breakpoints in a complex multi-section layout"
+    config_module: server.tasks
+    graders:
+      - color
+      - spacing
+      - typography
+      - contrast
+      - layout
+      - cleanliness
+
+  - id: task4
+    name: task4
+    difficulty: medium
+    description: "Medium: fix color, spacing, typography, contrast, layout, and cleanliness in a responsive landing section"
+    config_module: server.tasks
+    graders:
+      - color
+      - spacing
+      - typography
+      - contrast
+      - layout
+      - cleanliness
+
+action_space:
+  type: object
+  model: models.CssAction
+  properties:
+    action_type:
+      type: string
+      enum: [replace_color, fix_spacing, fix_typography, fix_contrast, add_breakpoint, remove_rule]
+      description: "Type of CSS edit to perform"
+    target:
+      type: string
+      description: "CSS selector or color value to target"
+    value:
+      type: string
+      description: "New value to apply (null for remove_rule)"
+      optional: true
+
+observation_space:
+  type: object
+  model: models.CssObservation
+  properties:
+    html:
+      type: string
+      description: "Reference HTML the CSS is applied to"
+    css:
+      type: string
+      description: "Current CSS state after last action"
+    tokens:
+      type: object
+      description: "Design token dict (colors, spacing, font_sizes, line_heights)"
+    violations:
+      type: array
+      description: "Hint list of detected violations (easy mode only)"
+      optional: true
+    scores:
+      type: object
+      description: "Per-grader scores: color, spacing, typography, contrast, layout, cleanliness, design_quality"
+    score:
+      type: number
+      description: "Minimum score across required graders"
+    success:
+      type: boolean
+      description: "True when all required graders exceed success_threshold"
+    changed:
+      type: boolean
+      description: "True if the last action modified the CSS"
+    no_op_action:
+      type: boolean
+      description: "True if the action had no effect"
+    repeated_action:
+      type: boolean
+      description: "True if the exact same action was already taken"
+    terminated_by_max_steps:
+      type: boolean
+      description: "True if episode ended due to step limit"
+
+reward_space:
+  type: number
+  description: "Weighted sum of grader scores with progress bonus/penalty and action quality modifiers"
+  range: [0.0, 1.2]
+
+grade_output:
+  type: object
+  model: models.CssObservation
+  properties:
+    score:
+      type: number
+      range: [0.0, 1.0]
+      description: "Overall score (min across required graders)"
+    breakdown:
+      type: object
+      description: "Per-grader scores: color, spacing, typography, contrast, layout, cleanliness, design_quality"
+    required_graders:
+      type: array
+      description: "Grader keys that must all pass for task success"
+
+models:
+  - models
+
+tags:
+  - openenv
+  - reinforcement-learning
+  - css
+  - design-tokens
+  - frontend

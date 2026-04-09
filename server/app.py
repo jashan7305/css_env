@@ -12,7 +12,13 @@ It preserves environment state across /reset, /step, and /state calls
 so validation and manual curl tests observe a single live episode.
 """
 
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    import yaml
+except Exception:  # pragma: no cover
+    yaml = None
 
 try:
     from cssselect2 import compile_selector_list
@@ -30,11 +36,11 @@ except Exception:  # pragma: no cover
 
 try:
     from ..models import CssAction, CssObservation
-    from ..tasks import TASKS, TASK_ORDER
+    from .tasks import TASKS, TASK_ORDER
     from .css_env_environment import CssEnvironment
 except ImportError:
     from models import CssAction, CssObservation
-    from tasks import TASKS, TASK_ORDER
+    from server.tasks import TASKS, TASK_ORDER
     from server.css_env_environment import CssEnvironment
 
 
@@ -42,7 +48,7 @@ class ResetRequest(BaseModel):
     seed: int = 0
     episode_id: Optional[str] = None
     task_name: Optional[str] = None
-    task: Optional[Dict[str, Any]] = None
+    task: Optional[Any] = None
 
 
 class StepRequest(BaseModel):
@@ -76,6 +82,16 @@ class MetadataResponse(BaseModel):
     version: str
     author: str
     documentation_url: str
+    tasks: Optional[Dict[str, Any]] = None
+    task_catalog: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class TaskCatalogItem(BaseModel):
+    id: str
+    name: str
+    difficulty: str
+    graders: List[str]
+    grader_weights: Dict[str, float]
 
 
 app = FastAPI(
@@ -90,6 +106,7 @@ app = FastAPI(
 
 _ENV = CssEnvironment()
 _CURRENT_TASK_NAME = "task1"
+_CONFIG_TASKS_CACHE: Optional[List[Dict[str, Any]]] = None
 
 
 def _resolve_task(request: ResetRequest) -> Tuple[str, Dict[str, Any]]:
@@ -99,17 +116,19 @@ def _resolve_task(request: ResetRequest) -> Tuple[str, Dict[str, Any]]:
         "hard": "task3",
     }
 
-    if request.task and isinstance(request.task, dict) and request.task:
+    if isinstance(request.task, dict) and request.task:
         task_name = request.task_name or request.task.get("name") or _CURRENT_TASK_NAME
         return str(task_name), request.task
 
-    if request.task_name:
-        requested = aliases.get(request.task_name.lower(), request.task_name.lower())
+    requested_name = request.task_name or (request.task if isinstance(request.task, str) else None)
+
+    if requested_name:
+        requested = aliases.get(requested_name.lower(), requested_name.lower())
         if requested == "all":
             requested = "task1"
         if requested in TASKS:
             return requested, TASKS[requested]
-        raise HTTPException(status_code=400, detail=f"Unknown task_name: {request.task_name}")
+        raise HTTPException(status_code=400, detail=f"Unknown task_name: {requested_name}")
 
     return _CURRENT_TASK_NAME, TASKS[_CURRENT_TASK_NAME]
 
@@ -193,6 +212,122 @@ def _current_observation() -> CssObservation:
         done=bool(_ENV.state_data.get("last_done", False)),
         metadata={"error": "Environment error"},
     )
+
+
+def _load_openenv_task_entries() -> List[Dict[str, Any]]:
+    global _CONFIG_TASKS_CACHE
+
+    if _CONFIG_TASKS_CACHE is not None:
+        return _CONFIG_TASKS_CACHE
+
+    if yaml is None:
+        _CONFIG_TASKS_CACHE = []
+        return _CONFIG_TASKS_CACHE
+
+    candidate_paths = [
+        Path(__file__).resolve().parents[1] / "openenv.yaml",
+        Path.cwd() / "openenv.yaml",
+    ]
+
+    for cfg_path in candidate_paths:
+        if not cfg_path.exists():
+            continue
+        try:
+            parsed = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+
+        tasks = parsed.get("tasks", [])
+        if isinstance(tasks, list):
+            _CONFIG_TASKS_CACHE = [entry for entry in tasks if isinstance(entry, dict)]
+            return _CONFIG_TASKS_CACHE
+
+    _CONFIG_TASKS_CACHE = []
+    return _CONFIG_TASKS_CACHE
+
+
+def _normalize_graders(raw_graders: Any) -> List[str]:
+    if not isinstance(raw_graders, list):
+        return []
+    return [str(grader).strip() for grader in raw_graders if str(grader).strip()]
+
+
+def _normalize_grader_weights(raw_weights: Any) -> Dict[str, float]:
+    if not isinstance(raw_weights, dict):
+        return {}
+
+    normalized_weights: Dict[str, float] = {}
+    for grader_key, weight in raw_weights.items():
+        try:
+            normalized_weights[str(grader_key)] = float(weight)
+        except (TypeError, ValueError):
+            continue
+    return normalized_weights
+
+
+def _graders_from_weights(raw_weights: Any) -> List[str]:
+    normalized_weights = _normalize_grader_weights(raw_weights)
+    return [grader_key for grader_key, weight in normalized_weights.items() if weight > 0.0]
+
+
+def _build_task_catalog() -> List[TaskCatalogItem]:
+    catalog: List[TaskCatalogItem] = []
+    seen_ids: Set[str] = set()
+
+    for task_entry in _load_openenv_task_entries():
+        task_id = str(task_entry.get("id") or task_entry.get("name") or "").strip()
+        if not task_id or task_id in seen_ids:
+            continue
+
+        task = TASKS.get(task_id)
+        task = task if isinstance(task, dict) else {}
+
+        graders = (
+            _normalize_graders(task_entry.get("graders"))
+            or _normalize_graders(task.get("graders"))
+            or _graders_from_weights(task.get("grader_weights"))
+        )
+        normalized_weights = _normalize_grader_weights(task.get("grader_weights"))
+
+        catalog.append(
+            TaskCatalogItem(
+                id=task_id,
+                name=str(task_entry.get("name") or task.get("name") or task_id),
+                difficulty=str(task_entry.get("difficulty") or task.get("difficulty") or "unknown"),
+                graders=graders,
+                grader_weights=normalized_weights,
+            )
+        )
+        seen_ids.add(task_id)
+
+    for task_id in TASK_ORDER:
+        if task_id in seen_ids:
+            continue
+
+        task = TASKS.get(task_id)
+        if not isinstance(task, dict):
+            continue
+
+        catalog.append(
+            TaskCatalogItem(
+                id=str(task_id),
+                name=str(task.get("name") or task_id),
+                difficulty=str(task.get("difficulty") or "unknown"),
+                graders=_normalize_graders(task.get("graders")) or _graders_from_weights(task.get("grader_weights")),
+                grader_weights=_normalize_grader_weights(task.get("grader_weights")),
+            )
+        )
+        seen_ids.add(task_id)
+
+    return catalog
+
+
+def _tasks_readme_section(task_catalog: List[TaskCatalogItem]) -> str:
+    lines = [f"Tasks with graders ({len(task_catalog)}):"]
+    for task in task_catalog:
+        graders_text = ", ".join(task.graders) if task.graders else "(none)"
+        lines.append(f"- {task.id} ({task.difficulty}): {graders_text}")
+    return "\n".join(lines)
 
 
 @app.get("/health")
@@ -320,17 +455,42 @@ curl -i https://YOUR_SPACE_URL/state</pre>
 
 @app.get("/metadata", response_model=MetadataResponse)
 async def endpoint_metadata() -> MetadataResponse:
+    task_catalog = _build_task_catalog()
+    tasks_metadata = {
+        task.id: {
+            "name": task.name,
+            "difficulty": task.difficulty,
+            "graders": task.graders,
+            "grader_weights": task.grader_weights,
+            "max_steps": TASKS.get(task.id, {}).get("max_steps"),
+            "success_threshold": TASKS.get(task.id, {}).get("success_threshold"),
+        }
+        for task in task_catalog
+    }
+    task_catalog_payload = [task.model_dump() for task in task_catalog]
+    readme_section = _tasks_readme_section(task_catalog)
+
     return MetadataResponse(
         name="css_env",
         description="OpenEnv-compatible CSS refinement environment for structured RL evaluation.",
         readme_content=(
             "The environment provides HTML, CSS, and design tokens to an RL agent and scores structured CSS edits "
-            "with deterministic graders."
+            "with deterministic graders.\n\n"
+            f"{readme_section}"
         ),
         version="0.1.0",
         author="Meta / OpenEnv",
         documentation_url="/docs",
+        tasks=tasks_metadata,
+        task_catalog=task_catalog_payload,
     )
+
+
+@app.get("/tasks")
+async def get_tasks() -> Dict[str, Any]:
+    """List all available tasks with discoverable grader metadata."""
+    task_catalog = [task.model_dump() for task in _build_task_catalog()]
+    return {"count": len(task_catalog), "tasks": task_catalog}
 
 
 @app.get("/schema", response_model=SchemaResponse)
@@ -427,6 +587,27 @@ async def step(request: StepRequest) -> StepResponse:
 @app.get("/state")
 async def endpoint_state() -> Any:
     return _ENV.state
+
+
+@app.get("/grade")
+async def endpoint_grade() -> Dict[str, Any]:
+    """Return score summary for compatibility with external validators."""
+    scores = dict(_ENV.state_data.get("last_scores", {}) or {})
+    task = TASKS.get(_CURRENT_TASK_NAME, TASKS.get("task1", {}))
+    required_graders = task.get("graders", [])
+
+    if required_graders:
+        required_values = [float(scores.get(key, 0.0)) for key in required_graders]
+        score = min(required_values) if required_values else 0.0
+    else:
+        score = min(scores.values()) if scores else 0.0
+
+    return {
+        "task": _CURRENT_TASK_NAME,
+        "score": max(0.0, min(1.0, float(score))),
+        "breakdown": scores,
+        "required_graders": required_graders,
+    }
 
 
 @app.get("/ws")

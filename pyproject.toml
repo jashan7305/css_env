@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openenv-css_env"
-version = "0.1.0"
+version = "1.0.0"
 description = "Css Env environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
@@ -45,5 +45,8 @@ server = "css_env.server.app:main"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["css_env", "css_env.server"]
-package-dir = { "css_env" = ".", "css_env.server" = "server" }
+package-dir = { "css_env" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["css_env*"]

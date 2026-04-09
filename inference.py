@@ -19,7 +19,10 @@ if load_dotenv is not None:
 
 from client import CssEnv
 from models import CssAction
-from tasks import TASK_CONFIGS, TASK_ORDER
+try:
+    from server.tasks import TASK_CONFIGS, TASK_ORDER
+except ImportError:
+    from tasks import TASK_CONFIGS, TASK_ORDER
 
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
