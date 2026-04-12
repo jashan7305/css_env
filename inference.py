@@ -1,868 +1,499 @@
+﻿"""
+Baseline inference agent for css_env.
+
+Uses the official OpenEnv EnvClient SDK (via the CssEnv client class
+defined in client.py at project root) to drive the environment.
+
+Reads environment variables:
+  - API_BASE_URL  (default: https://api.openai.com/v1)
+  - MODEL_NAME    (default: gpt-4o-mini)
+  - HF_TOKEN or API_KEY or OPENAI_API_KEY (required)
+
+Optional:
+  - LOCAL_IMAGE_NAME  - Docker image name. If set, the env is launched via
+                        CssEnv.from_docker_image(LOCAL_IMAGE_NAME).
+  - ENV_URL           - direct base URL of an already-running css_env server
+  - TASK_NAME         - task1/task2/task3/task4/easy/medium/hard/all
+  - MAX_STEPS         - hard cap on loop steps per task
+  - TEMPERATURE       - LLM sampling temperature
+  - MAX_TOKENS        - LLM max output tokens
+
+Emits the OpenEnv structured stdout format:
+  [START] task=<task_name> env=<benchmark> model=<model_name>
+  [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+  [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...,rn>
+"""
+
+from __future__ import annotations
+
 import asyncio
 import json
 import os
 import re
-import textwrap
-from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+import sys
+from typing import Any, Dict, List, Optional
 
-import httpx
 from openai import OpenAI
-
-try:
-    from dotenv import load_dotenv
-except Exception:  # pragma: no cover
-    load_dotenv = None
-
-if load_dotenv is not None:
-    load_dotenv()
 
 from client import CssEnv
 from models import CssAction
+
 try:
-    from server.tasks import TASK_CONFIGS, TASK_ORDER
+    from server.tasks import TASKS, TASK_ORDER
 except ImportError:
-    from tasks import TASK_CONFIGS, TASK_ORDER
+    from tasks import TASKS, TASK_ORDER
 
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-IMAGE_NAME = os.getenv("IMAGE_NAME", "css_env-env:latest")
-TASK_NAME = os.getenv("TASK_NAME", "task1")
-ENV_BASE_URL = os.getenv("ENV_BASE_URL", "")
-MAX_STEPS = int(os.getenv("MAX_STEPS", "20"))
-TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "250"))
-DEFAULT_SUCCESS_THRESHOLD = 0.95
-CURRENT_TASK_DIFFICULTY = "easy"
-
-
-class _HttpCssEnv:
-    """Minimal async HTTP adapter for reset/step/state endpoints."""
-
-    def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=60.0)
-
-    @staticmethod
-    def _parse_result(payload: Dict[str, Any]) -> Any:
-        obs_data = payload.get("observation", {}) or {}
-        observation = SimpleNamespace(
-            html=obs_data.get("html", ""),
-            css=obs_data.get("css", ""),
-            tokens=obs_data.get("tokens", {}) or {},
-            violations=obs_data.get("violations"),
-            scores=obs_data.get("scores") or {},
-            score=obs_data.get("score"),
-            success=obs_data.get("success"),
-            changed=obs_data.get("changed"),
-            no_op_action=obs_data.get("no_op_action"),
-            repeated_action=obs_data.get("repeated_action"),
-            terminated_by_max_steps=obs_data.get("terminated_by_max_steps"),
-            metadata=obs_data.get("metadata") or {},
-        )
-        return SimpleNamespace(
-            observation=observation,
-            reward=payload.get("reward"),
-            done=bool(payload.get("done", False)),
-        )
-
-    async def reset(self, task: Optional[Dict[str, Any]] = None, seed: int = 0) -> Any:
-        body: Dict[str, Any] = {"seed": seed}
-        if task is not None:
-            body["task"] = task
-        resp = await self._client.post(f"{self.base_url}/reset", json=body)
-        resp.raise_for_status()
-        return self._parse_result(resp.json())
-
-    async def step(self, action: CssAction) -> Any:
-        body = {
-            "action": {
-                "action_type": action.action_type,
-                "target": action.target,
-                "value": action.value,
-            }
-        }
-        resp = await self._client.post(f"{self.base_url}/step", json=body)
-        resp.raise_for_status()
-        return self._parse_result(resp.json())
-
-    async def close(self) -> None:
-        await self._client.aclose()
-
-
-async def _is_env_reachable(base_url: str, timeout_s: float = 5.0) -> bool:
-    try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
-            resp = await client.get(f"{base_url.rstrip('/')}/health")
-            return resp.status_code == 200
-    except Exception:
-        return False
-
-
-async def _init_env() -> Any:
-    if ENV_BASE_URL:
-        env = _HttpCssEnv(base_url=ENV_BASE_URL)
-        return env
-
-    docker_error = ""
-    try:
-        return await CssEnv.from_docker_image(IMAGE_NAME)
-    except Exception as exc:
-        docker_error = str(exc)
-
-    fallbacks = [
-        "http://127.0.0.1:7860",
-        "http://localhost:7860",
-        "http://127.0.0.1:8000",
-        "http://localhost:8000",
-    ]
-    for candidate in fallbacks:
-        if await _is_env_reachable(candidate):
-            return _HttpCssEnv(base_url=candidate)
-
-    raise RuntimeError(
-        f"Unable to initialize environment. Docker init failed: {docker_error or 'unknown error'}"
-    )
-
-SYSTEM_PROMPT = textwrap.dedent(
-    """
-    You are a frontend engineer fixing CSS to match design tokens.
-    Optimize for score improvement across all graders, not a single metric.
-    If the previous action had no effect or repeated a past action, choose a different action_type or target.
-    Do NOT repeat the same action if reward decreases.
-    If a change reduces reward, try a different action type.
-    Prioritize the lowest-scoring grader first.
-    Return ONLY valid JSON with this schema:
-    {
-      "action_type": "replace_color|fix_spacing|fix_typography|fix_contrast|add_breakpoint|remove_rule",
-      "target": "string",
-      "value": "string or null"
-    }
-    No markdown, no prose.
-    """
+# Configuration
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.openai.com/v1").strip()
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini").strip()
+LLM_API_KEY = (
+    os.getenv("HF_TOKEN")
+    or os.getenv("API_KEY")
+    or os.getenv("OPENAI_API_KEY")
+    or ""
 ).strip()
+
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "").strip()
+ENV_URL = os.getenv("ENV_URL", "http://localhost:8000").strip()
+TASK_NAME = os.getenv("TASK_NAME", "all").strip()
+MAX_STEPS = max(1, int(os.getenv("MAX_STEPS", "20")))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0"))
+MAX_TOKENS = max(64, int(os.getenv("MAX_TOKENS", "350")))
+BENCHMARK = "css_env"
+SCORE_EPSILON = 1e-6
+MIN_SCORE_BOUND = 0.01
+MAX_SCORE_BOUND = 0.99
+
+SYSTEM_PROMPT = """You are an expert frontend engineer fixing CSS to match design tokens.
+
+Return ONLY one JSON object with this schema:
+{
+  "action_type": "replace_color|fix_spacing|fix_typography|fix_contrast|add_breakpoint|remove_rule",
+  "target": "string",
+  "value": "string or null"
+}
+
+Guidelines:
+1. Prioritize the lowest score in observation.scores.
+2. Do not repeat the same action signature.
+3. Prefer targeted edits that change CSS and improve one dimension.
+4. If a previous action had no effect, choose a different action type.
+5. No markdown, no explanation, JSON only.
+"""
 
 
 def clamp01(value: float) -> float:
-    return max(0.0, min(1.0, value))
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = MIN_SCORE_BOUND + SCORE_EPSILON
+
+    if numeric <= MIN_SCORE_BOUND:
+        numeric = MIN_SCORE_BOUND + SCORE_EPSILON
+    if numeric >= MAX_SCORE_BOUND:
+        numeric = MAX_SCORE_BOUND - SCORE_EPSILON
+
+    rounded = round(numeric, 2)
+    if rounded <= MIN_SCORE_BOUND:
+        return 0.02
+    if rounded >= MAX_SCORE_BOUND:
+        return 0.98
+    return float(f"{rounded:.2f}")
 
 
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
-def log_step(step: int, action: Dict[str, Any], reward: float, done: bool, error: str = "null") -> None:
-    error_val = error if error else "null"
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str] = None) -> None:
+    done_str = "true" if done else "false"
+    error_str = error if error else "null"
     print(
-        f"[STEP] step={step} action={json.dumps(action, separators=(',', ':'))} reward={reward:.2f} done={str(done).lower()} error={error_val}",
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_str} error={error_str}",
         flush=True,
     )
 
 
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    success_str = "true" if success else "false"
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
-
-
-def build_user_prompt(
-    step: int,
-    html: str,
-    css: str,
-    tokens: Dict[str, Any],
-    violations: Any,
-    scores: Dict[str, float],
-    history: List[str],
-) -> str:
-    history_block = "\n".join(history[-4:]) if history else "None"
-    return textwrap.dedent(
-        f"""
-        Step: {step}
-        HTML:
-        {html}
-
-        Current CSS:
-        {css}
-
-        Tokens:
-        {json.dumps(tokens)}
-
-        Violations:
-        {json.dumps(violations)}
-
-        Current scores:
-        {json.dumps(scores, separators=(',', ':'))}
-
-        Previous steps:
-        {history_block}
-
-        Choose an action that changes CSS and improves one of the lowest scores.
-        Avoid repeating the same action_type+target+value used in recent steps.
-        """
-    ).strip()
-
-
-def safe_action_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
-    action_type = payload.get("action_type", "replace_color")
-    target = payload.get("target", "#000000")
-    value = payload.get("value", "#000000")
-
-    if action_type == "remove_rule":
-        value = None
-
-    return {
-        "action_type": str(action_type),
-        "target": str(target),
-        "value": None if value is None else str(value),
-    }
-
-
-def default_fallback_action(css: str, tokens: Dict[str, Any]) -> Dict[str, Any]:
-    selectors = _extract_selectors(css)
-    spacing_tokens = sorted(
-        {int(v) for v in (tokens.get("spacing") or {}).values() if isinstance(v, (int, float))}
+    print(
+        f"[END] success={success_str} steps={steps} score={clamp01(score):.3f} rewards={rewards_str}",
+        flush=True,
     )
 
-    if selectors and spacing_tokens:
-        mid_idx = len(spacing_tokens) // 2
-        return {
-            "action_type": "fix_spacing",
-            "target": f"{selectors[0]}.margin",
-            "value": f"{spacing_tokens[mid_idx]}px",
-        }
 
-    if selectors:
-        return {
-            "action_type": "remove_rule",
-            "target": selectors[-1],
-            "value": None,
-        }
-
-    return {
-        "action_type": "add_breakpoint",
-        "target": "768px",
-        "value": "body { width: 100%; }",
-    }
+def _task_description(task_name: str) -> str:
+    cfg = TASKS.get(task_name, {})
+    return str(cfg.get("description") or cfg.get("difficulty") or task_name)
 
 
-def action_signature(action: Dict[str, Any]) -> str:
-    value = "null" if action.get("value") is None else str(action.get("value"))
-    return f"{action.get('action_type')}|{action.get('target')}|{value}"
+def _select_tasks(task_name: str) -> List[str]:
+    aliases = {"easy": "task1", "medium": "task2", "hard": "task3"}
+    requested = aliases.get(task_name.lower(), task_name.lower())
 
+    if requested == "all":
+        return [name for name in TASK_ORDER if name in TASKS]
+    if requested in TASKS:
+        return [requested]
 
-def _score_key_for_action_type(action_type: str) -> str:
-    mapping = {
-        "replace_color": "color",
-        "fix_spacing": "spacing",
-        "fix_typography": "typography",
-        "fix_contrast": "contrast",
-        "add_breakpoint": "layout",
-        "remove_rule": "cleanliness",
-    }
-    return mapping.get(action_type, "")
-
-
-def _extract_hex_colors(css: str) -> List[str]:
-    return re.findall(r"#(?:[0-9a-fA-F]{3}){1,2}", css)
-
-
-def _normalize_hex(color: str) -> str:
-    color = str(color).strip().lower()
-    if not color.startswith("#"):
-        return color
-    if len(color) == 4:
-        return "#" + "".join(ch * 2 for ch in color[1:])
-    return color
-
-
-def _parse_css_blocks(css: str) -> List[Tuple[str, Dict[str, str]]]:
-    blocks: List[Tuple[str, Dict[str, str]]] = []
-    for selector_group, body in re.findall(r"([^{}]+)\{([^{}]+)\}", css):
-        selectors = [s.strip() for s in selector_group.split(",") if s.strip() and not s.strip().startswith("@")]
-        decl_map: Dict[str, str] = {}
-        for declaration in body.split(";"):
-            if ":" not in declaration:
-                continue
-            prop, val = declaration.split(":", 1)
-            prop = prop.strip().lower()
-            val = val.strip()
-            if prop and val:
-                decl_map[prop] = val
-        if not decl_map:
-            continue
-        for selector in selectors:
-            blocks.append((selector, dict(decl_map)))
-    return blocks
+    known = ",".join(["all", "easy", "medium", "hard", *TASKS.keys()])
+    raise ValueError(f"Unknown TASK_NAME '{task_name}'. Expected one of: {known}")
 
 
 def _extract_selectors(css: str) -> List[str]:
     selectors: List[str] = []
-    for selector, _ in _parse_css_blocks(css):
-        if selector not in selectors:
-            selectors.append(selector)
+    for selector_group in re.findall(r"([^{}]+)\{", css or ""):
+        for raw in selector_group.split(","):
+            selector = raw.strip()
+            if selector and selector not in selectors:
+                selectors.append(selector)
     return selectors
 
 
-def _selector_matches_html(selector: str, html: str) -> bool:
-    base = re.split(r"::?|\s+|>|\+|~", selector.strip())[-1]
-    if not base or base == "*":
-        return True
-
-    if base.startswith("."):
-        class_name = base[1:]
-        return bool(re.search(rf'class\s*=\s*["\'][^"\']*\b{re.escape(class_name)}\b', html))
-
-    if base.startswith("#"):
-        element_id = base[1:]
-        return bool(re.search(rf'id\s*=\s*["\']{re.escape(element_id)}["\']', html))
-
-    if re.match(r"^[a-zA-Z][a-zA-Z0-9-]*$", base):
-        return bool(re.search(rf"<{re.escape(base)}(?:\s|>)", html))
-
-    return False
+def _extract_colors(css: str) -> List[str]:
+    return re.findall(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", css or "")
 
 
-def _compute_unused_selectors(css: str, html: str) -> List[str]:
+def _first_selector(css: str) -> str:
     selectors = _extract_selectors(css)
-    unused = [selector for selector in selectors if not _selector_matches_html(selector, html)]
-    return sorted(set(unused))
+    return selectors[0] if selectors else ".container"
 
 
-def _nearest_int(value: int, options: List[int]) -> int:
-    return min(options, key=lambda opt: abs(opt - value))
+def _build_user_prompt(observation: Any, step: int, task_name: str) -> str:
+    html = str(getattr(observation, "html", ""))
+    css = str(getattr(observation, "css", ""))
+    tokens = getattr(observation, "tokens", {}) or {}
+    violations = getattr(observation, "violations", None)
+    scores = getattr(observation, "scores", {}) or {}
+    prev_score = getattr(observation, "score", None)
 
+    html_preview = html[:3000]
+    css_preview = css[:5000]
 
-def _first_hex(value: str) -> str:
-    matches = _extract_hex_colors(value or "")
-    return _normalize_hex(matches[0]) if matches else ""
-
-
-def _spacing_candidates(css: str, tokens: Dict[str, Any]) -> List[Dict[str, Any]]:
-    blocks = _parse_css_blocks(css)
-    spacing_tokens = sorted({int(v) for v in (tokens.get("spacing") or {}).values() if isinstance(v, (int, float))})
-    if not spacing_tokens:
-        return []
-
-    spacing_props = {
-        "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
-        "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
-        "gap", "row-gap", "column-gap",
-    }
-    px_re = re.compile(r"(\d+)px")
-    candidates: List[Dict[str, Any]] = []
-
-    for selector, decl_map in blocks:
-        for prop in spacing_props:
-            value = decl_map.get(prop)
-            if not value or "px" not in value:
-                continue
-
-            changed = False
-
-            def repl(match):
-                nonlocal changed
-                current = int(match.group(1))
-                nearest = _nearest_int(current, spacing_tokens)
-                if nearest != current:
-                    changed = True
-                return f"{nearest}px"
-
-            new_value = px_re.sub(repl, value)
-            if changed and new_value != value:
-                candidates.append({
-                    "action_type": "fix_spacing",
-                    "target": f"{selector}.{prop}",
-                    "value": new_value,
-                })
-
-    return candidates
-
-
-def _typography_candidates(css: str, tokens: Dict[str, Any]) -> List[Dict[str, Any]]:
-    blocks = _parse_css_blocks(css)
-    font_tokens = [str(v).strip() for v in (tokens.get("font_sizes") or []) if str(v).strip()]
-    line_tokens = [str(v).strip() for v in (tokens.get("line_heights") or []) if str(v).strip()]
-    font_px_tokens = [int(re.match(r"^(\d+)px$", token).group(1)) for token in font_tokens if re.match(r"^(\d+)px$", token)]
-    line_float_tokens = [float(token) for token in line_tokens if re.match(r"^\d+(?:\.\d+)?$", token)]
-
-    candidates: List[Dict[str, Any]] = []
-
-    for selector, decl_map in blocks:
-        font_size = decl_map.get("font-size")
-        if font_size and font_size.strip() not in font_tokens:
-            match = re.match(r"^(\d+)px$", font_size.strip())
-            if match and font_px_tokens:
-                nearest = _nearest_int(int(match.group(1)), font_px_tokens)
-                candidates.append({
-                    "action_type": "fix_typography",
-                    "target": f"{selector}.font-size",
-                    "value": f"{nearest}px",
-                })
-
-        line_height = decl_map.get("line-height")
-        if line_height and line_height.strip() not in line_tokens and line_float_tokens:
-            match = re.match(r"^(\d+(?:\.\d+)?)$", line_height.strip())
-            if match:
-                current = float(match.group(1))
-                nearest = min(line_float_tokens, key=lambda opt: abs(opt - current))
-                candidates.append({
-                    "action_type": "fix_typography",
-                    "target": f"{selector}.line-height",
-                    "value": str(nearest),
-                })
-
-    return candidates
-
-
-def _contrast_ratio(fg_hex: str, bg_hex: str) -> float:
-    def to_rgb(color: str) -> Tuple[int, int, int]:
-        color = _normalize_hex(color).lstrip("#")
-        if len(color) == 3:
-            color = "".join(ch * 2 for ch in color)
-        if len(color) != 6:
-            return (0, 0, 0)
-        return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
-
-    def luminance(rgb: Tuple[int, int, int]) -> float:
-        def channel(c: float) -> float:
-            c = c / 255.0
-            return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
-
-        r, g, b = rgb
-        rr, gg, bb = channel(r), channel(g), channel(b)
-        return 0.2126 * rr + 0.7152 * gg + 0.0722 * bb
-
-    l1 = luminance(to_rgb(fg_hex))
-    l2 = luminance(to_rgb(bg_hex))
-    bright, dark = max(l1, l2), min(l1, l2)
-    return (bright + 0.05) / (dark + 0.05)
-
-
-def _contrast_candidates(css: str, tokens: Dict[str, Any]) -> List[Dict[str, Any]]:
-    blocks = _parse_css_blocks(css)
-    token_colors = tokens.get("colors") or {}
-    text_color = _normalize_hex(token_colors.get("text", "#333333"))
-    bg_color = _normalize_hex(token_colors.get("white", "#ffffff"))
-
-    candidates: List[Dict[str, Any]] = []
-    for selector, decl_map in blocks:
-        fg = _first_hex(decl_map.get("color", ""))
-        if not fg:
-            continue
-        bg = _first_hex(decl_map.get("background-color", "")) or _first_hex(decl_map.get("background", "")) or bg_color
-        if _contrast_ratio(fg, bg) < 4.5:
-            candidates.append({
-                "action_type": "fix_contrast",
-                "target": selector,
-                "value": f"{text_color},{bg_color}",
-            })
-
-    return candidates
-
-
-def _color_candidates(css: str, tokens: Dict[str, Any]) -> List[Dict[str, Any]]:
-    blocks = _parse_css_blocks(css)
-    token_colors_map = tokens.get("colors") or {}
-    token_colors = {_normalize_hex(v) for v in token_colors_map.values() if v}
-    if not token_colors:
-        return []
-
-    text_color = _normalize_hex(token_colors_map.get("text", "#333333"))
-    white_color = _normalize_hex(token_colors_map.get("white", "#ffffff"))
-    primary_color = _normalize_hex(token_colors_map.get("primary", text_color))
-
-    usage: Dict[str, Dict[str, int]] = {}
-    for _, decl_map in blocks:
-        for prop, value in decl_map.items():
-            if "color" not in prop and "background" not in prop and "border" not in prop:
-                continue
-            for found in _extract_hex_colors(value):
-                normalized = _normalize_hex(found)
-                if normalized in token_colors:
-                    continue
-                info = usage.setdefault(normalized, {"fg": 0, "bg": 0, "total": 0})
-                info["total"] += 1
-                if "background" in prop:
-                    info["bg"] += 1
-                else:
-                    info["fg"] += 1
-
-    candidates: List[Dict[str, Any]] = []
-    for source, info in sorted(usage.items(), key=lambda item: item[1]["total"], reverse=True):
-        replacement = white_color if info["bg"] > info["fg"] else text_color
-        if replacement == source:
-            replacement = primary_color if primary_color != source else white_color
-        if replacement != source:
-            candidates.append({
-                "action_type": "replace_color",
-                "target": source,
-                "value": replacement,
-            })
-
-    return candidates
-
-
-def _cleanliness_candidates(css: str, html: str) -> List[Dict[str, Any]]:
-    return [
-        {"action_type": "remove_rule", "target": selector, "value": None}
-        for selector in _compute_unused_selectors(css, html)
-    ]
-
-
-def _layout_candidates(css: str) -> List[Dict[str, Any]]:
-    if "@media" in css or CURRENT_TASK_DIFFICULTY == "easy":
-        return []
-    selectors = _extract_selectors(css)
-    preferred = [".container", ".main", ".card", ".form", ".header"]
-    selected = next((selector for selector in preferred if selector in selectors), None)
-    if selected is None:
-        selected = next((selector for selector in selectors if selector.startswith(".")), ".container")
-    return [{
-        "action_type": "add_breakpoint",
-        "target": "768px",
-        "value": f"{selected} {{ width: 100%; }}",
-    }]
-
-
-def _dedupe_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    deduped: List[Dict[str, Any]] = []
-    seen: set = set()
-    for action in actions:
-        safe = safe_action_dict(action)
-        sig = action_signature(safe)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        deduped.append(safe)
-    return deduped
-
-
-def _action_target_exists(obs, action_payload: Dict[str, Any]) -> bool:
-    css = getattr(obs, "css", "")
-    selectors = set(_extract_selectors(css))
-    action_type = action_payload.get("action_type", "")
-    target = str(action_payload.get("target", ""))
-
-    if action_type == "replace_color":
-        normalized_target = _normalize_hex(target)
-        css_colors = {_normalize_hex(color) for color in _extract_hex_colors(css)}
-        return normalized_target in css_colors
-    if action_type == "remove_rule":
-        return target in selectors
-    if action_type in {"fix_spacing", "fix_typography"}:
-        if "." not in target:
-            return False
-        selector, _ = target.rsplit(".", 1)
-        return selector in selectors
-    if action_type == "fix_contrast":
-        return target in selectors
-    if action_type == "add_breakpoint":
-        return True
-    return False
-
-
-def _action_payload_is_well_formed(action_payload: Dict[str, Any]) -> bool:
-    action_type = str(action_payload.get("action_type", ""))
-    target = str(action_payload.get("target", "")).strip()
-    value = action_payload.get("value")
-
-    if action_type == "replace_color":
-        return bool(re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", target)) and isinstance(value, str)
-    if action_type in {"fix_spacing", "fix_typography"}:
-        return "." in target and isinstance(value, str) and bool(value.strip())
-    if action_type == "fix_contrast":
-        return isinstance(value, str) and "," in value
-    if action_type == "add_breakpoint":
-        return bool(re.fullmatch(r"\d+px", target)) and isinstance(value, str) and "{" in value and "}" in value
-    if action_type == "remove_rule":
-        return bool(target)
-    return False
-
-
-def _action_matches_candidates(obs, action_payload: Dict[str, Any], success_threshold: float) -> bool:
-    candidates = _candidate_actions(obs, success_threshold)
-    if not candidates:
-        return True
-    sig = action_signature(safe_action_dict(action_payload))
-    candidate_sigs = {action_signature(candidate) for candidate in candidates}
-    return sig in candidate_sigs
-
-
-def _candidate_actions(obs, success_threshold: float) -> List[Dict[str, Any]]:
-    scores = getattr(obs, "scores", None) or {}
-    tokens = getattr(obs, "tokens", {}) or {}
-    css = getattr(obs, "css", "")
-    html = getattr(obs, "html", "")
-
-    metric_generators = {
-        "spacing": lambda: _spacing_candidates(css, tokens),
-        "color": lambda: _color_candidates(css, tokens),
-        "typography": lambda: _typography_candidates(css, tokens),
-        "contrast": lambda: _contrast_candidates(css, tokens),
-        "cleanliness": lambda: _cleanliness_candidates(css, html),
-        "layout": lambda: _layout_candidates(css),
-    }
-
-    candidates: List[Dict[str, Any]] = []
-
-    ordered_metrics = [
-        metric
-        for metric, metric_score in sorted(scores.items(), key=lambda kv: kv[1])
-        if metric in metric_generators and metric_score < success_threshold
-    ]
-
-    for metric in ordered_metrics:
-        candidates.extend(metric_generators[metric]())
-
-    if not candidates:
-        for metric in ["cleanliness", "spacing", "typography", "contrast", "color", "layout"]:
-            candidates.extend(metric_generators[metric]())
-
-    if not candidates:
-        candidates = [default_fallback_action(css, tokens)]
-
-    return _dedupe_actions(candidates)
-
-
-def choose_non_repeating_action(
-    obs,
-    seen_signatures: List[str],
-    success_threshold: float,
-    avoid_action_type: str = "",
-) -> Dict[str, Any]:
-    blocked = set(seen_signatures)
-    scores = getattr(obs, "scores", None) or {}
-    for candidate in _candidate_actions(obs, success_threshold):
-        sig = action_signature(candidate)
-        if avoid_action_type and candidate.get("action_type") == avoid_action_type:
-            continue
-        score_key = _score_key_for_action_type(candidate.get("action_type", ""))
-        if score_key and scores.get(score_key, 0.0) >= success_threshold:
-            continue
-        if sig not in blocked:
-            return candidate
-
-    fallback_pool = _candidate_actions(obs, success_threshold)
-    if not fallback_pool:
-        fallback_pool = [default_fallback_action(getattr(obs, "css", ""), getattr(obs, "tokens", {}) or {})]
-
-    for candidate in [safe_action_dict(c) for c in fallback_pool]:
-        if avoid_action_type and candidate.get("action_type") == avoid_action_type:
-            continue
-        if action_signature(candidate) not in blocked:
-            return candidate
-
-    usage_counts: Dict[str, int] = {}
-    for seen_sig in seen_signatures:
-        usage_counts[seen_sig] = usage_counts.get(seen_sig, 0) + 1
-
-    ranked = sorted(
-        [safe_action_dict(candidate) for candidate in fallback_pool],
-        key=lambda candidate: usage_counts.get(action_signature(candidate), 0),
+    return (
+        f"Task: {task_name} - {_task_description(task_name)}\n"
+        f"Step: {step}\n"
+        f"Current score: {prev_score}\n"
+        f"Scores: {json.dumps(scores, separators=(',', ':'))}\n"
+        f"Violations: {json.dumps(violations)}\n"
+        f"Tokens: {json.dumps(tokens, separators=(',', ':'))}\n\n"
+        f"HTML:\n{html_preview}\n\n"
+        f"CSS:\n{css_preview}\n"
     )
-    return ranked[0]
 
 
-def should_override_action(
-    obs,
-    action_payload: Dict[str, Any],
-    seen_signatures: List[str],
-    success_threshold: float,
-    reward_decreased: bool = False,
-    last_action_type: str = "",
-) -> bool:
-    if CURRENT_TASK_DIFFICULTY == "easy" and action_payload.get("action_type") == "add_breakpoint":
-        return True
-
-    if reward_decreased and last_action_type and action_payload.get("action_type") == last_action_type:
-        return True
-
-    if not _action_payload_is_well_formed(action_payload):
-        return True
-
-    if not _action_target_exists(obs, action_payload):
-        return True
-
-    if not _action_matches_candidates(obs, action_payload, success_threshold):
-        return True
-
-    sig = action_signature(action_payload)
-    if sig in set(seen_signatures):
-        return True
-
-    scores = getattr(obs, "scores", None) or {}
-    score_key = _score_key_for_action_type(action_payload.get("action_type", ""))
-    if score_key and scores.get(score_key, 0.0) >= success_threshold:
-        return True
-
-    return False
-
-
-def get_model_action(client: OpenAI, step: int, obs, history: List[str]) -> Optional[Dict[str, Any]]:
-    scores = getattr(obs, "scores", None) or {}
-    prompt = build_user_prompt(step, obs.html, obs.css, obs.tokens, obs.violations, scores, history)
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            stream=False,
-        )
-        text = (completion.choices[0].message.content or "").strip()
-        parsed = json.loads(text)
-        return safe_action_dict(parsed)
-    except Exception:
+def _parse_action_json(text: str) -> Optional[Dict[str, Any]]:
+    raw = (text or "").strip()
+    if not raw:
         return None
 
+    if "```" in raw:
+        lines = raw.splitlines()
+        capture: List[str] = []
+        in_block = False
+        for line in lines:
+            if line.strip().startswith("```"):
+                if in_block:
+                    break
+                in_block = True
+                continue
+            if in_block:
+                capture.append(line)
+        if capture:
+            raw = "\n".join(capture).strip()
 
-def select_tasks(task_name_value: str) -> List[Tuple[str, Dict[str, Any]]]:
-    requested = task_name_value.lower()
-    aliases = {
-        "easy": "task1",
-        "medium": "task2",
-        "hard": "task3",
-    }
-    requested = aliases.get(requested, requested)
-    if requested == "all":
-        return [(name, TASK_CONFIGS[name]) for name in TASK_ORDER if name in TASK_CONFIGS]
-    if requested in TASK_CONFIGS:
-        return [(requested, TASK_CONFIGS[requested])]
-    raise ValueError(f"Unknown TASK_NAME: {task_name_value}. Expected one of: {','.join(TASK_CONFIGS.keys())},all")
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
 
-
-async def run_task(
-    env: CssEnv,
-    llm_client: OpenAI,
-    task_name: str,
-    task_config: Dict[str, Any],
-) -> None:
-    global CURRENT_TASK_DIFFICULTY
-
-    CURRENT_TASK_DIFFICULTY = str(task_config.get("difficulty", "easy")).lower()
-    success_threshold = clamp01(float(task_config.get("success_threshold", DEFAULT_SUCCESS_THRESHOLD)))
-    max_steps_for_task = int(task_config.get("max_steps", MAX_STEPS))
-    max_steps_for_task = max(1, min(max_steps_for_task, MAX_STEPS))
-
-    history: List[str] = []
-    recent_action_signatures: List[str] = []
-    rewards: List[float] = []
-    prev_reward = 0.0
-    last_action_type = ""
-    steps_taken = 0
-    success = False
-    score = 0.0
-
-    log_start(task=task_name, env="css_env", model=MODEL_NAME)
     try:
-        result = await env.reset(task=task_config, seed=7)
+        payload = json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+    return payload if isinstance(payload, dict) else None
+
+
+def _fallback_action(observation: Any) -> Dict[str, Any]:
+    css = str(getattr(observation, "css", ""))
+    tokens = getattr(observation, "tokens", {}) or {}
+    selector = _first_selector(css)
+
+    token_colors = list((tokens.get("colors") or {}).values())
+    colors = _extract_colors(css)
+    if colors and token_colors:
+        replacement = str(token_colors[0])
+        if replacement != colors[0]:
+            return {
+                "action_type": "replace_color",
+                "target": colors[0],
+                "value": replacement,
+            }
+
+    spacing = (tokens.get("spacing") or {}).get("md", 16)
+    return {
+        "action_type": "fix_spacing",
+        "target": f"{selector}.margin",
+        "value": f"{int(spacing)}px",
+    }
+
+
+def _normalize_action(action: Dict[str, Any], observation: Any) -> Dict[str, Any]:
+    allowed = {
+        "replace_color",
+        "fix_spacing",
+        "fix_typography",
+        "fix_contrast",
+        "add_breakpoint",
+        "remove_rule",
+    }
+
+    safe = dict(action or {})
+    action_type = str(safe.get("action_type", "")).strip()
+    if action_type not in allowed:
+        return _fallback_action(observation)
+
+    css = str(getattr(observation, "css", ""))
+    selectors = _extract_selectors(css)
+    first_selector = selectors[0] if selectors else ".container"
+
+    target = str(safe.get("target", "")).strip()
+    value = safe.get("value", None)
+
+    if action_type == "replace_color":
+        colors = _extract_colors(css)
+        if not target or target not in colors:
+            target = colors[0] if colors else "#333333"
+        if value is None or not str(value).strip():
+            value = "#1a6fe0"
+        return {"action_type": action_type, "target": target, "value": str(value)}
+
+    if action_type in {"fix_spacing", "fix_typography"}:
+        if "." not in target:
+            prop = "margin" if action_type == "fix_spacing" else "font-size"
+            target = f"{first_selector}.{prop}"
+        if value is None or not str(value).strip():
+            value = "16px"
+        return {"action_type": action_type, "target": target, "value": str(value)}
+
+    if action_type == "fix_contrast":
+        if not target:
+            target = first_selector
+        if value is None or "," not in str(value):
+            value = "#333333,#ffffff"
+        return {"action_type": action_type, "target": target, "value": str(value)}
+
+    if action_type == "add_breakpoint":
+        if not re.fullmatch(r"\d+px", target):
+            target = "768px"
+        if value is None or "{" not in str(value):
+            value = f"{first_selector} {{ width: 100%; }}"
+        return {"action_type": action_type, "target": target, "value": str(value)}
+
+    if action_type == "remove_rule":
+        if not target:
+            target = selectors[-1] if selectors else ".unused"
+        return {"action_type": action_type, "target": target, "value": None}
+
+    return _fallback_action(observation)
+
+
+def _action_str(action: Dict[str, Any]) -> str:
+    return json.dumps(action, separators=(",", ":"), ensure_ascii=True)
+
+
+def _make_openai_client() -> OpenAI:
+    if not LLM_API_KEY:
+        raise ValueError("Missing API key. Set HF_TOKEN or API_KEY or OPENAI_API_KEY.")
+    return OpenAI(base_url=API_BASE_URL, api_key=LLM_API_KEY)
+
+
+def _probe_llm(client: OpenAI) -> None:
+    client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "Reply with exactly ok"},
+            {"role": "user", "content": "ok"},
+        ],
+        temperature=0,
+        max_tokens=2,
+    )
+
+
+async def _init_env() -> CssEnv:
+    if LOCAL_IMAGE_NAME:
+        return await CssEnv.from_docker_image(LOCAL_IMAGE_NAME)
+
+    env = CssEnv(base_url=ENV_URL)
+    await env.connect()
+    return env
+
+
+def _task_step_limit(task_cfg: Dict[str, Any]) -> int:
+    task_limit = int(task_cfg.get("max_steps", MAX_STEPS) or MAX_STEPS)
+    return max(1, min(task_limit, MAX_STEPS))
+
+
+def _task_threshold(task_cfg: Dict[str, Any]) -> float:
+    return clamp01(float(task_cfg.get("success_threshold", 0.95)))
+
+
+def _llm_action(client: OpenAI, observation: Any, step: int, task_name: str) -> Dict[str, Any]:
+    prompt = _build_user_prompt(observation, step, task_name)
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
+    )
+    text = completion.choices[0].message.content or ""
+    parsed = _parse_action_json(text)
+    if parsed is None:
+        return _fallback_action(observation)
+    return _normalize_action(parsed, observation)
+
+
+async def run_task(env: CssEnv, llm_client: OpenAI, task_name: str, task_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+
+    rewards: List[float] = []
+    final_score = 0.0
+    steps_taken = 0
+    final_success = False
+
+    try:
+        reset_result = await env.reset(task=task_cfg, seed=7)
+        observation = reset_result.observation
+        done = bool(reset_result.done)
     except Exception as exc:
-        log_step(step=0, action={"action_type": "reset", "target": "", "value": None}, reward=0.0, done=True, error=f"reset_failed:{exc}")
+        log_step(step=0, action="{}", reward=0.0, done=True, error=f"reset_failed:{exc}")
         log_end(success=False, steps=0, score=0.0, rewards=[])
+        return {"score": 0.0, "steps": 0, "rewards": []}
+
+    max_steps = _task_step_limit(task_cfg)
+    threshold = _task_threshold(task_cfg)
+
+    for step in range(1, max_steps + 1):
+        if done:
+            break
+
+        llm_error: Optional[str] = None
+        try:
+            action_payload = _llm_action(llm_client, observation, step, task_name)
+        except Exception as exc:
+            llm_error = f"llm_error:{exc}"
+            action_payload = _fallback_action(observation)
+
+        action_payload = _normalize_action(action_payload, observation)
+        action_text = _action_str(action_payload)
+
+        step_error: Optional[str] = llm_error
+        try:
+            step_result = await env.step(CssAction(**action_payload))
+        except Exception as exc:
+            step_error = f"step_failed:{exc}"
+            action_payload = _fallback_action(observation)
+            action_text = _action_str(action_payload)
+            try:
+                step_result = await env.step(CssAction(**action_payload))
+            except Exception as exc2:
+                log_step(step=step, action=action_text, reward=0.0, done=True, error=f"step_failed:{exc2}")
+                steps_taken = step
+                break
+
+        reward = clamp01(float(step_result.reward or 0.0))
+        done = bool(step_result.done)
+        observation = step_result.observation
+        rewards.append(reward)
+        steps_taken = step
+
+        observed_score = getattr(observation, "score", None)
+        if observed_score is not None:
+            final_score = clamp01(float(observed_score))
+        elif rewards:
+            final_score = clamp01(sum(rewards) / len(rewards))
+
+        final_success = bool(getattr(observation, "success", False)) or (final_score >= threshold)
+        log_step(step=step, action=action_text, reward=reward, done=done, error=step_error)
+
+    if not rewards:
+        final_score = 0.0
+
+    log_end(success=final_success, steps=steps_taken, score=final_score, rewards=rewards)
+    return {"score": final_score, "steps": steps_taken, "rewards": rewards}
+
+
+async def main_async() -> None:
+    try:
+        tasks_to_run = _select_tasks(TASK_NAME)
+    except Exception as exc:
+        print(f"[DEBUG] Invalid task selection: {exc}", file=sys.stderr, flush=True)
         return
 
     try:
-        for step in range(1, max_steps_for_task + 1):
-            action_payload = get_model_action(llm_client, step, result.observation, history)
-            if action_payload is None:
-                action_payload = choose_non_repeating_action(
-                    result.observation,
-                    recent_action_signatures,
-                    success_threshold=success_threshold,
-                    avoid_action_type=last_action_type,
-                )
-
-            reward_decreased = bool(rewards) and (rewards[-1] < prev_reward)
-            if should_override_action(
-                result.observation,
-                action_payload,
-                recent_action_signatures,
-                success_threshold=success_threshold,
-                reward_decreased=reward_decreased,
-                last_action_type=last_action_type,
-            ):
-                action_payload = choose_non_repeating_action(
-                    result.observation,
-                    recent_action_signatures,
-                    success_threshold=success_threshold,
-                    avoid_action_type=last_action_type if reward_decreased else "",
-                )
-
-            error_val = "null"
-            try:
-                result = await env.step(CssAction(**action_payload))
-            except Exception as exc:
-                error_val = str(exc)
-                try:
-                    action_payload = choose_non_repeating_action(
-                        result.observation,
-                        recent_action_signatures,
-                        success_threshold=success_threshold,
-                    )
-                    result = await env.step(CssAction(**action_payload))
-                except Exception as exc2:
-                    log_step(step=step, action=action_payload, reward=0.0, done=True, error=f"step_failed:{exc2}")
-                    break
-
-            reward = clamp01(float(result.reward or 0.0))
-            done = bool(getattr(result, "done", False))
-            success = bool(getattr(result.observation, "success", False))
-            if not success and done:
-                success = reward >= success_threshold
-
-            rewards.append(reward)
-            prev_reward = rewards[-2] if len(rewards) >= 2 else reward
-            steps_taken = step
-            recent_action_signatures.append(action_signature(action_payload))
-            last_action_type = str(action_payload.get("action_type", ""))
-            score = clamp01(float(getattr(result.observation, "score", score) or score))
-
-            history.append(f"step={step} action={action_payload} reward={reward:.2f}")
-            log_step(step=step, action=action_payload, reward=reward, done=done, error=error_val)
-
-            if done:
-                break
+        llm_client = _make_openai_client()
+        _probe_llm(llm_client)
     except Exception as exc:
-        log_step(step=max(steps_taken, 0), action={"action_type": "internal_error", "target": "", "value": None}, reward=0.0, done=True, error=str(exc))
-    finally:
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+        for task_name in tasks_to_run:
+            log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+            log_step(step=0, action="{}", reward=0.0, done=True, error=f"llm_init_failed:{exc}")
+            log_end(success=False, steps=0, score=0.0, rewards=[])
+        return
 
+    env: Optional[CssEnv] = None
+    results: Dict[str, Dict[str, Any]] = {}
 
-async def main() -> None:
-    llm_client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
-    selected_tasks = select_tasks(TASK_NAME)
-
-    env: Optional[Any] = None
     try:
         env = await _init_env()
     except Exception as exc:
-        for task_name, _ in selected_tasks:
-            log_start(task=task_name, env="css_env", model=MODEL_NAME)
-            log_step(step=0, action={"action_type": "init", "target": "", "value": None}, reward=0.0, done=True, error=f"env_init_failed:{exc}")
+        for task_name in tasks_to_run:
+            log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+            log_step(step=0, action="{}", reward=0.0, done=True, error=f"env_init_failed:{exc}")
             log_end(success=False, steps=0, score=0.0, rewards=[])
         return
 
     try:
-        for task_name, task_config in selected_tasks:
-            try:
-                await run_task(
-                    env=env,
-                    llm_client=llm_client,
-                    task_name=task_name,
-                    task_config=task_config,
-                )
-            except Exception as exc:
-                log_start(task=task_name, env="css_env", model=MODEL_NAME)
-                log_step(step=0, action={"action_type": "task", "target": task_name, "value": None}, reward=0.0, done=True, error=f"task_failed:{exc}")
+        for task_name in tasks_to_run:
+            task_cfg = dict(TASKS.get(task_name, {}))
+            if not task_cfg:
+                log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+                log_step(step=0, action="{}", reward=0.0, done=True, error="missing_task_config")
                 log_end(success=False, steps=0, score=0.0, rewards=[])
+                continue
+
+            try:
+                results[task_name] = await run_task(env, llm_client, task_name, task_cfg)
+            except Exception as exc:
+                log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+                log_step(step=0, action="{}", reward=0.0, done=True, error=f"task_failed:{exc}")
+                log_end(success=False, steps=0, score=0.0, rewards=[])
+                results[task_name] = {"score": 0.0, "steps": 0, "rewards": []}
     finally:
         if env is not None:
-            await env.close()
+            try:
+                await env.close()
+            except Exception as exc:
+                print(f"[DEBUG] env.close() error: {exc}", file=sys.stderr, flush=True)
+
+    print("\n=== Final Results ===", file=sys.stderr)
+    total = 0.0
+    for task_name in tasks_to_run:
+        score = clamp01(float(results.get(task_name, {}).get("score", 0.0)))
+        total += score
+        print(f"  {task_name}: score={score:.4f}", file=sys.stderr)
+    if tasks_to_run:
+        print(f"  average: {total / len(tasks_to_run):.4f}", file=sys.stderr)
+
+
+def main() -> None:
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

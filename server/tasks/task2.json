@@ -1,0 +1,13 @@
+{
+  "id": "task2",
+  "name": "task2",
+  "difficulty": "medium",
+  "graders": ["color", "typography", "contrast"],
+  "grader_weights": {
+    "color": 0.3,
+    "typography": 0.35,
+    "contrast": 0.35
+  },
+  "max_steps": 25,
+  "success_threshold": 0.95
+}

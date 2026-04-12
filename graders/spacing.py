@@ -1,4 +1,4 @@
-from .utils import extract_css_val, px_to_num
+from .utils import clamp_open_unit_interval, extract_css_val, px_to_num
 
 # this grader checks if the spacing values are in 4px grid multiples . 
 
@@ -19,16 +19,16 @@ def grade(html, css, tokens, state=None):
                         pass
         
         if not nums:
-            return 1.0
+            return clamp_open_unit_interval(1.0)
         
         token_spacing = set(tokens.get("spacing", {}).values())
         
         if not token_spacing:
-            return 0.0
+            return clamp_open_unit_interval(0.0)
         
         valid = sum(1 for n in nums if n in token_spacing) # counts the valida values 
 
         score = float(valid / len(nums))
-        return max(0.0, min(1.0, score))
+        return clamp_open_unit_interval(score)
     except Exception:
-        return 0.0
+        return clamp_open_unit_interval(0.0)

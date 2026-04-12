@@ -11,7 +11,7 @@ The css_env environment is a simple test environment that echoes back messages.
 """
 
 from openenv.core.env_server.types import Action, Observation
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from typing import Optional, Literal, Dict, List
 
@@ -108,4 +108,20 @@ class CssObservation(Observation):
     terminated_by_max_steps: Optional[bool] = Field(
         default=None,
         description="True when episode ended due to step limit before success"
+    )
+
+
+class GradeResult(BaseModel):
+    """Structured grade payload for environment-level grading."""
+
+    score: float = Field(..., description="Overall weighted score in [0, 1]")
+
+    breakdown: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-component grader scores included in the active rubric",
+    )
+
+    details: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Human-readable explanation per grading component",
     )

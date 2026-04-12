@@ -1,10 +1,11 @@
 import re
+from .utils import clamp_open_unit_interval
 
 
  # random design elements taken care of by this grader  
 def grade(html, css, tokens, state=None):
     if not css.strip():
-        return 1.0
+        return clamp_open_unit_interval(1.0)
 
     score = 1.0
 
@@ -56,4 +57,4 @@ def grade(html, css, tokens, state=None):
     if pill_radius > 0:
         score -= 0.08 * pill_radius
 
-    return max(0.0, min(1.0, score))
+    return clamp_open_unit_interval(score)

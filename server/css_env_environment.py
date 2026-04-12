@@ -11,31 +11,35 @@ Css Env Environment Implementation.
 """
 
 import re
+import sys
+import math
+from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
 
+_ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+
 try:
-    from ..models import CssAction, CssObservation
-    from ..reward import compute_reward
-    from ..graders import colors, spacing, typography, contrast, layout, cleanliness, design_quality
-    from ..graders.task_graders import TASK_GRADERS
+    from .models import CssAction, CssObservation, GradeResult
+except ImportError:
+    from models import CssAction, CssObservation, GradeResult
+
+from reward import compute_reward
+from graders import colors, spacing, typography, contrast, layout, cleanliness, design_quality
+
+try:
     from .tasks import TASKS
     from .action_engine import apply_action
     from .flaw_injector import inject_flaws
 except ImportError:
-    from models import CssAction, CssObservation
-    from reward import compute_reward
-    from graders import colors, spacing, typography, contrast, layout, cleanliness, design_quality
-    from graders.task_graders import TASK_GRADERS
     from server.tasks import TASKS
     from server.action_engine import apply_action
     from server.flaw_injector import inject_flaws
-
-
-TASK_GRADER_REGISTRY = TASK_GRADERS
 
 
 class CssEnvironment(Environment):
@@ -67,6 +71,18 @@ class CssEnvironment(Environment):
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
     HIGH_SCORE_GUARD_THRESHOLD: float = 0.90
     HIGH_SCORE_MAX_DROP: float = 0.03
+    SCORE_EPSILON: float = 1e-6
+    MIN_SCORE_BOUND: float = 0.01
+    MAX_SCORE_BOUND: float = 0.99
+    SUPPORTED_GRADERS = (
+        "color",
+        "spacing",
+        "typography",
+        "contrast",
+        "layout",
+        "cleanliness",
+        "design_quality",
+    )
 
     def __init__(self):
         """Initialize the css_env environment."""
@@ -78,6 +94,13 @@ class CssEnvironment(Environment):
         self.difficulty = "easy"
         self.success_threshold = 0.95
         self.required_graders = ["color", "spacing", "typography", "contrast", "cleanliness"]
+        self.grader_weights = {
+            "color": 0.30,
+            "spacing": 0.20,
+            "typography": 0.20,
+            "contrast": 0.20,
+            "cleanliness": 0.10,
+        }
         self.step_count = 0 # current step count
         self.max_steps = 20 # maximum steps
         self.state_data = {} # tracks progress
@@ -132,11 +155,25 @@ class CssEnvironment(Environment):
             self.difficulty = task.get("difficulty", "easy")
             self.max_steps = int(task.get("max_steps", self.max_steps))
             self.success_threshold = float(task.get("success_threshold", 0.95))
-            required_graders = task.get("graders", self.required_graders)
-            if isinstance(required_graders, list) and required_graders:
-                self.required_graders = [str(k) for k in required_graders]
+            task_weights = self._normalize_grader_weights(task.get("grader_weights", {}))
+            task_graders = task.get("required_graders", task.get("graders", self.required_graders))
+            required_graders = [
+                str(key).strip() for key in (task_graders if isinstance(task_graders, list) else []) if str(key).strip()
+            ]
+            required_graders = [
+                key for key in required_graders if key in self.SUPPORTED_GRADERS
+            ]
+            if not required_graders:
+                required_graders = [
+                    key for key, weight in task_weights.items() if weight > 0.0 and key in self.SUPPORTED_GRADERS
+                ]
+
+            if required_graders:
+                self.required_graders = required_graders
             else:
                 self.required_graders = ["color", "spacing", "typography", "contrast", "cleanliness"]
+
+            self.grader_weights = task_weights or self._default_weights_for_graders(self.required_graders)
 
             clean_css = task.get("css", task.get("clean_css", ""))
 
@@ -168,9 +205,12 @@ class CssEnvironment(Environment):
                 "last_irrelevant": False,
                 "action_counts": {},
                 "required_graders": list(self.required_graders),
+                "grader_weights": dict(self.grader_weights),
             }
 
-            self.state_data["last_scores"] = self._run_graders()
+            initial_grade = self.grade()
+            self.state_data["last_scores"] = dict(initial_grade.breakdown)
+            self.state_data["last_grade"] = float(initial_grade.score)
             self.state_data["peak_score"] = (
                 min(self.state_data["last_scores"].values())
                 if self.state_data.get("last_scores")
@@ -192,7 +232,7 @@ class CssEnvironment(Environment):
                 tokens=self.tokens,
                 violations=violations,
                 scores=self.state_data.get("last_scores", {}),
-                score=min(self.state_data.get("last_scores", {}).values()) if self.state_data.get("last_scores") else 0.0,
+                score=float(self.state_data.get("last_grade", 0.0)),
                 success=False,
                 changed=True,
                 no_op_action=False,
@@ -206,7 +246,7 @@ class CssEnvironment(Environment):
         """
         prev_scores = dict(self.state_data.get("last_scores", {}))
         prev_reward = self.state_data.get("last_reward")
-        prev_score = min(prev_scores.values()) if prev_scores else 0.0
+        prev_score = float(self.state_data.get("last_grade", min(prev_scores.values()) if prev_scores else 0.0))
         prev_peak_score = float(self.state_data.get("peak_score", prev_score))
         old_css = self.css
         new_css, _ = apply_action(self.css, action)
@@ -220,7 +260,8 @@ class CssEnvironment(Environment):
         no_op_action = not css_changed
 
         self.css = new_css
-        scores = self._run_graders()
+        grade_result = self.grade()
+        scores = dict(grade_result.breakdown)
         success = self._is_done(scores)
         irrelevant_action = self._is_irrelevant_action(action, prev_scores)
 
@@ -244,7 +285,7 @@ class CssEnvironment(Environment):
         # End the episode immediately once all required scores meet the threshold.
         if success:
             self.step_count += 1
-            score = min(scores.values()) if scores else 0.0
+            score = float(grade_result.score)
 
             info = {
                 "scores": scores,
@@ -269,6 +310,7 @@ class CssEnvironment(Environment):
 
             self.state_data["step_count"] = self.step_count
             self.state_data["last_scores"] = scores
+            self.state_data["last_grade"] = score
             self.state_data["last_reward"] = reward
             self.state_data["last_done"] = True
             self.state_data["last_success"] = True
@@ -322,7 +364,7 @@ class CssEnvironment(Environment):
             or same_action_cap_reached
         )
         terminated_by_max_steps = done and not success
-        score = min(scores.values()) if scores else 0.0
+        score = float(grade_result.score)
 
         high_score_degradation = (
             prev_peak_score >= self.HIGH_SCORE_GUARD_THRESHOLD
@@ -361,6 +403,7 @@ class CssEnvironment(Environment):
 
         self.state_data["step_count"] = self.step_count
         self.state_data["last_scores"] = scores
+        self.state_data["last_grade"] = score
         self.state_data["last_reward"] = reward
         self.state_data["last_done"] = done
         self.state_data["last_success"] = success
@@ -408,18 +451,130 @@ class CssEnvironment(Environment):
             no_op_action=self.state_data.get("last_no_op", False),
             scores=self.state_data.get("last_scores", {}),
         )
-    
+
+    @staticmethod
+    def _normalize_grader_weights(raw_weights: Dict[str, float]) -> Dict[str, float]:
+        if not isinstance(raw_weights, dict):
+            return {}
+
+        normalized: Dict[str, float] = {}
+        for grader_key, weight in raw_weights.items():
+            key = str(grader_key).strip()
+            if not key:
+                continue
+            try:
+                normalized[key] = float(weight)
+            except (TypeError, ValueError):
+                continue
+
+        return normalized
+
+    @staticmethod
+    def _default_weights_for_graders(graders: List[str]) -> Dict[str, float]:
+        normalized = [str(key).strip() for key in graders if str(key).strip()]
+        if not normalized:
+            return {}
+        equal_weight = 1.0 / float(len(normalized))
+        return {key: equal_weight for key in normalized}
+
+    def _active_grader_weights(self) -> Dict[str, float]:
+        candidate = self.state_data.get("grader_weights", self.grader_weights)
+        weights = {
+            key: value
+            for key, value in self._normalize_grader_weights(candidate).items()
+            if key in self.SUPPORTED_GRADERS
+        }
+        if weights:
+            return weights
+        return self._default_weights_for_graders(list(self.required_graders))
+
+    @classmethod
+    def _clamp_open_unit_interval(cls, value: float) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = cls.MIN_SCORE_BOUND + cls.SCORE_EPSILON
+        if not math.isfinite(numeric):
+            numeric = cls.MIN_SCORE_BOUND + cls.SCORE_EPSILON
+        if numeric <= cls.MIN_SCORE_BOUND:
+            numeric = cls.MIN_SCORE_BOUND + cls.SCORE_EPSILON
+        if numeric >= cls.MAX_SCORE_BOUND:
+            numeric = cls.MAX_SCORE_BOUND - cls.SCORE_EPSILON
+
+        rounded = round(numeric, 2)
+        if rounded <= cls.MIN_SCORE_BOUND:
+            return 0.02
+        if rounded >= cls.MAX_SCORE_BOUND:
+            return 0.98
+        return float(f"{rounded:.2f}")
+
+    def grade(self) -> GradeResult:
+        """Grade the current CSS using task-configured grader weights."""
+        all_scores = self._run_graders()
+        weights = self._active_grader_weights()
+
+        breakdown: Dict[str, float] = {}
+        details: Dict[str, str] = {}
+        weighted_sum = 0.0
+        weight_sum = 0.0
+
+        for grader_key, weight in weights.items():
+            if weight <= 0.0:
+                continue
+
+            component_score = float(all_scores.get(grader_key, 0.0))
+            breakdown[grader_key] = component_score
+            weighted_sum += component_score * weight
+            weight_sum += weight
+            details[grader_key] = (
+                f"component={grader_key}, score={component_score:.4f}, weight={weight:.4f}"
+            )
+
+        if not breakdown:
+            required = list(self.required_graders) or ["color", "spacing", "typography", "contrast", "cleanliness"]
+            for grader_key in required:
+                component_score = float(all_scores.get(grader_key, 0.0))
+                breakdown[grader_key] = component_score
+                details[grader_key] = (
+                    f"component={grader_key}, score={component_score:.4f}, weight=auto"
+                )
+            score = min(breakdown.values()) if breakdown else 0.0
+            return GradeResult(score=self._clamp_open_unit_interval(score), breakdown=breakdown, details=details)
+
+        score = (weighted_sum / weight_sum) if weight_sum > 0.0 else 0.0
+        return GradeResult(score=self._clamp_open_unit_interval(score), breakdown=breakdown, details=details)
 
     def _run_graders(self) -> Dict[str, float]:
         return {
-            "color": self._safe_grade(colors.grade),
-            "spacing": self._safe_grade(spacing.grade),
-            "typography": self._safe_grade(typography.grade),
-            "contrast": self._safe_grade(contrast.grade),
-            "layout": self._safe_grade(layout.grade),
-            "cleanliness": self._safe_grade(cleanliness.grade),
-            "design_quality": self._safe_grade(design_quality.grade),
+            "color": self._grade_color(),
+            "spacing": self._grade_spacing(),
+            "typography": self._grade_typography(),
+            "contrast": self._grade_contrast(),
+            "layout": self._grade_layout(),
+            "cleanliness": self._grade_cleanliness(),
+            "design_quality": self._grade_design_quality(),
         }
+
+    def _grade_color(self) -> float:
+        return self._safe_grade(colors.grade)
+
+    def _grade_spacing(self) -> float:
+        return self._safe_grade(spacing.grade)
+
+    def _grade_typography(self) -> float:
+        return self._safe_grade(typography.grade)
+
+    def _grade_contrast(self) -> float:
+        return self._safe_grade(contrast.grade)
+
+    def _grade_layout(self) -> float:
+        return self._safe_grade(layout.grade)
+
+    def _grade_cleanliness(self) -> float:
+        return self._safe_grade(cleanliness.grade)
+
+    def _grade_design_quality(self) -> float:
+        return self._safe_grade(design_quality.grade)
 
     def _is_done(self, scores: Dict[str, float]) -> bool:
         required = list(self.state_data.get("required_graders") or self.required_graders)
@@ -430,9 +585,9 @@ class CssEnvironment(Environment):
     def _safe_grade(self, grader_fn) -> float:
         try:
             score = float(grader_fn(self.html, self.css, self.tokens, self.state_data))
-            return max(0.0, min(1.0, score))
+            return self._clamp_open_unit_interval(score)
         except Exception:
-            return 0.0
+            return self.MIN_SCORE_BOUND + self.SCORE_EPSILON
 
     def _compute_unused_selectors(self, css: str, html: str) -> List[str]:
         selector_groups = re.findall(r"([^{}]+)\{", css)

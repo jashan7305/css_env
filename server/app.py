@@ -13,6 +13,7 @@ so validation and manual curl tests observe a single live episode.
 """
 
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
@@ -29,19 +30,27 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+_ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+
 try:
     from openenv.core.env_server.types import State
 except Exception:  # pragma: no cover
     State = None
 
 try:
-    from ..models import CssAction, CssObservation
+    from .models import CssAction, CssObservation, GradeResult
     from .tasks import TASKS, TASK_ORDER
     from .css_env_environment import CssEnvironment
 except ImportError:
-    from models import CssAction, CssObservation
-    from server.tasks import TASKS, TASK_ORDER
-    from server.css_env_environment import CssEnvironment
+    from models import CssAction, CssObservation, GradeResult
+    try:
+        from tasks import TASKS, TASK_ORDER
+        from css_env_environment import CssEnvironment
+    except ImportError:
+        from server.tasks import TASKS, TASK_ORDER
+        from server.css_env_environment import CssEnvironment
 
 
 class ResetRequest(BaseModel):
@@ -117,7 +126,15 @@ def _resolve_task(request: ResetRequest) -> Tuple[str, Dict[str, Any]]:
     }
 
     if isinstance(request.task, dict) and request.task:
-        task_name = request.task_name or request.task.get("name") or _CURRENT_TASK_NAME
+        raw_name = request.task_name or request.task.get("id") or request.task.get("name") or _CURRENT_TASK_NAME
+        task_name = aliases.get(str(raw_name).lower(), str(raw_name).lower())
+
+        base_task = TASKS.get(task_name)
+        if isinstance(base_task, dict):
+            merged_task = dict(base_task)
+            merged_task.update(request.task)
+            return task_name, merged_task
+
         return str(task_name), request.task
 
     requested_name = request.task_name or (request.task if isinstance(request.task, str) else None)
@@ -195,7 +212,8 @@ def _current_observation() -> CssObservation:
     css = _ENV.css or fallback_task.get("css", "")
     tokens = _ENV.tokens or fallback_task.get("design_tokens", fallback_task.get("tokens", {}))
     scores = dict(_ENV.state_data.get("last_scores", {}) or {})
-    score = min(scores.values()) if scores else 0.0
+    score = min(scores.values()) if scores else (_ENV.MIN_SCORE_BOUND + _ENV.SCORE_EPSILON)
+    score = _ENV._clamp_open_unit_interval(score)
     return CssObservation(
         html=html,
         css=css,
@@ -589,25 +607,10 @@ async def endpoint_state() -> Any:
     return _ENV.state
 
 
-@app.get("/grade")
-async def endpoint_grade() -> Dict[str, Any]:
-    """Return score summary for compatibility with external validators."""
-    scores = dict(_ENV.state_data.get("last_scores", {}) or {})
-    task = TASKS.get(_CURRENT_TASK_NAME, TASKS.get("task1", {}))
-    required_graders = task.get("graders", [])
-
-    if required_graders:
-        required_values = [float(scores.get(key, 0.0)) for key in required_graders]
-        score = min(required_values) if required_values else 0.0
-    else:
-        score = min(scores.values()) if scores else 0.0
-
-    return {
-        "task": _CURRENT_TASK_NAME,
-        "score": max(0.0, min(1.0, float(score))),
-        "breakdown": scores,
-        "required_graders": required_graders,
-    }
+@app.get("/grade", response_model=GradeResult)
+async def endpoint_grade() -> GradeResult:
+    """Return weighted grading result discovered from task grader weights."""
+    return _ENV.grade()
 
 
 @app.get("/ws")

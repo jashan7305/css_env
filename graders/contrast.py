@@ -1,4 +1,5 @@
 import re 
+from .utils import clamp_open_unit_interval
 
 # this grader checks if the text and bg are contrasting well i.e. readablity 
 
@@ -50,7 +51,7 @@ def grade(html, css, tokens, state=None):
         state = state or {}
         rule_blocks = re.findall(r"[^{}]+\{([^{}]+)\}", css)
         if not rule_blocks:
-            return 1.0
+            return clamp_open_unit_interval(1.0)
 
         evaluations = []
         default_bg = tokens.get("colors", {}).get("white", "#ffffff")
@@ -69,11 +70,11 @@ def grade(html, css, tokens, state=None):
             evaluations.append((fg, bg))
 
         if not evaluations:
-            return 1.0
+            return clamp_open_unit_interval(1.0)
 
         valid = sum(1 for fg, bg in evaluations if contrast_ratio(fg, bg) >= 4.5)
 
         score = float(valid / len(evaluations))
-        return max(0.0, min(1.0, score))
+        return clamp_open_unit_interval(score)
     except Exception:
-        return 0.0
+        return clamp_open_unit_interval(0.0)

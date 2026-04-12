@@ -25,7 +25,18 @@ GRADER_KEYS = [
 
 
 def _clamp01(value):
-    return max(0.0, min(1.0, float(value)))
+    numeric = float(value)
+    if numeric <= 0.01:
+        numeric = 0.010001
+    if numeric >= 0.99:
+        numeric = 0.989999
+
+    rounded = round(numeric, 2)
+    if rounded <= 0.01:
+        return 0.02
+    if rounded >= 0.99:
+        return 0.98
+    return float(f"{rounded:.2f}")
 
 
 def _extract_unused_from_manifest(manifest):
@@ -126,7 +137,7 @@ def _run_adversarial_spacing_test(tokens):
     score = _clamp01(score)
 
     print(f"  spacing score for multi-value shorthand: {score:.4f}")
-    return 0.0 <= score <= 1.0
+    return 0.0 < score < 1.0
 
 
 def test_task(task_key, task_info, seed=7):

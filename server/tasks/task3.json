@@ -1,0 +1,16 @@
+{
+  "id": "task3",
+  "name": "task3",
+  "difficulty": "hard",
+  "graders": ["color", "spacing", "typography", "contrast", "layout", "cleanliness"],
+  "grader_weights": {
+    "color": 0.2,
+    "spacing": 0.2,
+    "typography": 0.2,
+    "contrast": 0.15,
+    "layout": 0.15,
+    "cleanliness": 0.1
+  },
+  "max_steps": 30,
+  "success_threshold": 0.9
+}

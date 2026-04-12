@@ -1,19 +1,44 @@
 {
   "tasks": [
     {
+      "id": "task1",
       "task_id": "task1",
+      "name": "task1",
+      "difficulty": "easy",
+      "enabled": true,
       "description": "Easy: align card component colors, spacing, and cleanliness to design tokens.",
-      "grader_id": "bitwise_css_easy"
+      "grader_id": "bitwise_css_easy",
+      "graders": ["bitwise_css_easy"]
     },
     {
+      "id": "task2",
       "task_id": "task2",
+      "name": "task2",
+      "difficulty": "medium",
+      "enabled": true,
       "description": "Medium: fix navbar typography, contrast, and color compliance.",
-      "grader_id": "bitwise_css_medium"
+      "grader_id": "bitwise_css_medium",
+      "graders": ["bitwise_css_medium"]
     },
     {
+      "id": "task3",
       "task_id": "task3",
+      "name": "task3",
+      "difficulty": "hard",
+      "enabled": true,
       "description": "Hard: repair dashboard layout, spacing, typography, contrast, and cleanup issues.",
-      "grader_id": "bitwise_css_hard"
+      "grader_id": "bitwise_css_hard",
+      "graders": ["bitwise_css_hard"]
+    },
+    {
+      "id": "task4",
+      "task_id": "task4",
+      "name": "task4",
+      "difficulty": "medium",
+      "enabled": true,
+      "description": "Medium: responsive landing section scoring across color, spacing, typography, contrast, layout, and cleanliness.",
+      "grader_id": "bitwise_css_task4",
+      "graders": ["bitwise_css_task4"]
     }
   ],
   "graders": {
@@ -28,6 +53,10 @@
     "bitwise_css_hard": {
       "type": "deterministic",
       "entrypoint": "graders.task_graders:bitwise_css_hard"
+    },
+    "bitwise_css_task4": {
+      "type": "deterministic",
+      "entrypoint": "graders.task_graders:bitwise_css_task4"
     }
   }
 }

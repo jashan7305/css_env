@@ -1,6 +1,6 @@
 spec_version: 1
 name: css_env
-description: "CSS Design Token Refinement — fix color, spacing, typography, contrast, layout, and cleanliness violations using design tokens"
+description: "CSS Design Token Refinement - fix color, spacing, typography, contrast, layout, and cleanliness violations using design tokens"
 version: "1.0.0"
 author: "BitWise Team"
 

@@ -3,7 +3,4 @@
 *egg-info*
 .env
 tasks.py
-__pycache__
-*.pyc
-*.pyo
-build/
+.pytest_cache

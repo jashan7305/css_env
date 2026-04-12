@@ -1,19 +1,20 @@
 import re
+from .utils import clamp_open_unit_interval
 
 def grade_fluid(html, css, tokens, state=None):
     widths = re.findall(r"(?<!max-)(?<!min-)width\s*:\s*([^;]+);", css)
 
     if not widths:
-        return 1.0
+        return clamp_open_unit_interval(1.0)
     fluid = sum(1 for w in widths if any(x in w for x in ["%", "vw", "auto", "fr"]))
     score = fluid / len(widths)
-    return max(0.0, min(1.0, score))
+    return clamp_open_unit_interval(score)
 
 
 def grade_breakpoints(html, css, tokens, state=None):
     media_matches = re.findall(r"@media\s*\(([^\)]+)\)\s*\{([\s\S]*?)\}", css, flags=re.IGNORECASE)
     if not media_matches:
-        return 0.0
+        return clamp_open_unit_interval(0.0)
 
     def _in_range(condition_text: str) -> bool:
         values = [int(v) for v in re.findall(r"(\d+)px", condition_text)]
@@ -38,7 +39,7 @@ def grade_breakpoints(html, css, tokens, state=None):
             valid += 1
 
     score = min(valid / 2.0, 1.0)
-    return max(0.0, min(1.0, score))
+    return clamp_open_unit_interval(score)
 
 
 def grade(html, css, tokens, state=None):
@@ -47,6 +48,6 @@ def grade(html, css, tokens, state=None):
         breakpoint_score = grade_breakpoints(html, css, tokens, state)
 
         score = float((fluid_score + breakpoint_score) / 2.0)
-        return max(0.0, min(1.0, score))
+        return clamp_open_unit_interval(score)
     except Exception:
-        return 0.0
+        return clamp_open_unit_interval(0.0)

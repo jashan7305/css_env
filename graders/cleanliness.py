@@ -1,4 +1,5 @@
 import re
+from .utils import clamp_open_unit_interval
 
 def extract_selectors(css):
     try:
@@ -21,9 +22,9 @@ def grade(html, css, tokens, state=None):
         removed = initial - current
         
         if not initial:
-            return 1.0
+            return clamp_open_unit_interval(1.0)
 
         score = float(len(removed) / len(initial))
-        return max(0.0, min(1.0, score))
+        return clamp_open_unit_interval(score)
     except Exception:
-        return 0.0
+        return clamp_open_unit_interval(0.0)
